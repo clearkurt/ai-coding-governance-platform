@@ -1,0 +1,14 @@
+{
+  "name": "ai-coding-governance-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"npm run dev -w @platform/api\" \"npm run dev -w @platform/web\"",
+    "build": "npm run build -w @platform/web && npm run build -w @platform/api",
+    "start": "npm run start -w @platform/api",
+    "test": "npm run test -w @platform/api",
+    "init-admin": "npm run init-admin -w @platform/api"
+  },
+  "devDependencies": { "concurrently": "^9.1.2" }
+}

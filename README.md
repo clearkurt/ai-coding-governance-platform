@@ -1,11 +1,52 @@
 # 企业内部 AI 编程助手管控平台
 
-面向嵌入式研发团队的内部 AI 编程助手：以网页入口、中央管理服务和受控本地 Agent 为基础，逐步沉淀公司的代码规范、芯片资料与 LCD 段码映射知识。
+面向嵌入式研发团队的内部 AI 编程助手 MVP。当前版本验证“登录 → 上传源码 → 输入需求 → 按公司规范生成代码草案 → 审计留痕”的闭环；默认使用 Mock 模型，不会执行、编译或改写用户工程文件。
 
-## 首个验证场景
+## 技术栈
 
-LCD 段码映射助手：从 SEG/COM 映射资料和现有工程中整理、校验并生成符合公司规范的 LCD 驱动映射代码。
+- React + Vite + TypeScript 中文前端
+- Fastify + TypeScript 服务端
+- Node.js 24 内置 SQLite 与 Argon2id 密码哈希，无 Docker、无独立数据库
+- 规范文档：[knowledge/code-style.md](knowledge/code-style.md)
 
-## 当前状态
+## 快速启动（开发机）
 
-项目处于方案与 MVP 定义阶段。
+要求 Node.js 24 或更高版本。
+
+```powershell
+npm install
+Copy-Item .env.example .env
+$env:ADMIN_USERNAME = 'admin'
+$env:ADMIN_PASSWORD = '请设置强密码'
+npm run init-admin
+npm run dev
+```
+
+浏览器访问 `http://localhost:5173`。开发时前端自动转发 `/api` 到 `http://localhost:3000`。
+
+## Windows Server 部署
+
+```powershell
+npm ci
+npm run build
+$env:NODE_ENV = 'production'
+$env:HOST = '0.0.0.0'
+$env:PORT = '3000'
+$env:DATA_DIR = 'D:\ai-coding-platform-data'
+$env:SESSION_SECRET = '替换为长随机字符串'
+$env:ADMIN_USERNAME = 'admin'
+$env:ADMIN_PASSWORD = '替换为强密码'
+npm run init-admin
+npm start
+```
+
+生产模式由 Fastify 同时提供 API 和网页静态文件，访问 `http://服务器地址:3000`。Windows 防火墙只需为内网开放该端口。`DATA_DIR` 中的 `platform.sqlite` 与 `uploads` 是业务数据，应定期备份；恢复时停止服务后还原整个目录。
+
+## 当前接口
+
+- `POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`
+- `POST /api/files`：最多 5 个 `.c`、`.h`、`.txt`、`.md`，每个最大 1 MB
+- `POST /api/conversations`、`GET /api/conversations`、`GET /api/conversations/:id`
+- `POST /api/conversations/:id/messages`
+
+管理员账号仅通过 `init-admin` 初始化。请勿提交 `.env`、数据库、上传文件或真实模型密钥。
