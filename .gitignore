@@ -5,4 +5,5 @@ data-test/
 uploads/
 .env
 *.tsbuildinfo
+apps/agent/target/
 runtime-check/

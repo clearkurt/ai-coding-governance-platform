@@ -12,6 +12,8 @@ const login = await app.inject({ method: 'POST', url: '/api/auth/login', payload
 if (login.statusCode !== 200) throw new Error(`登录失败：${login.body}`);
 const setCookie = login.headers['set-cookie'];
 const cookie = (Array.isArray(setCookie) ? setCookie[0] : setCookie!).split(';')[0];
+const pairing = await app.inject({ method: 'POST', url: '/api/agent/pairing-codes', headers: { cookie } });
+if (pairing.statusCode !== 200 || !pairing.json().code) throw new Error(`配对码创建失败：${pairing.body}`);
 const created = await app.inject({ method: 'POST', url: '/api/conversations', headers: { cookie }, payload: { title: 'LCD 冒号闪烁' } });
 if (created.statusCode !== 200) throw new Error(`创建会话失败：${created.body}`);
 const conversationId = created.json().conversation.id;
