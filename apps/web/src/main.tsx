@@ -35,8 +35,8 @@ function AgentPanel({ context, onContext }: { context: AgentContext | null; onCo
   const load = () => api<{ devices: Device[] }>('/api/agents').then(result => { setDevices(result.devices); if (!context && result.devices[0]?.roots[0]) onContext({ deviceId: result.devices[0].id, rootId: result.devices[0].roots[0].id }); }).catch(() => undefined);
   useEffect(() => { load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
   const selected = devices.find(device => device.id === context?.deviceId);
-  const wait = async (taskId: string) => { const timer = setInterval(async () => { try { const detail = await api<{ task: { status: string }; events: Array<unknown> }>(`/api/agent-tasks/${taskId}`); setTaskText(JSON.stringify(detail, null, 2)); if (['completed', 'failed', 'rejected', 'expired'].includes(detail.task.status)) { clearInterval(timer); load(); } } catch { clearInterval(timer); } }, 1000); };
-  const task = async (kind: string, payload: Record<string, unknown>) => { if (!context) return; setTaskText('Agent 正在处理…'); try { const result = await api<{ taskId: string }>(`/api/agents/${context.deviceId}/tasks`, { method: 'POST', body: JSON.stringify({ rootId: context.rootId, kind, payload }) }); wait(result.taskId); } catch (e) { setTaskText((e as Error).message); } };
+  const wait = async (taskId: string, kind?: string) => { const timer = setInterval(async () => { try { const detail = await api<{ task: { status: string; kind:string }; events: Array<unknown> }>(`/api/agent-tasks/${taskId}`); if (['completed', 'failed', 'rejected', 'expired'].includes(detail.task.status)) { clearInterval(timer); load(); setTaskText(detail.task.status==='completed'&&detail.task.kind==='select_root'?'目录已更换':detail.task.status==='completed'?'任务完成':`任务${detail.task.status}`); } else { setTaskText(detail.task.status==='dispatched'?'任务已派发，等待 Agent 响应…':`状态：${detail.task.status}`); } } catch { clearInterval(timer); } }, 1000); };
+  const task = async (kind: string, payload: Record<string, unknown>) => { if (!context) return; const messages:Record<string,string>={select_root:'正在打开文件夹选择器，请在弹出的窗口中操作…',read_file:'正在读取文件…',list_files:'正在列出文件…'}; setTaskText(messages[kind]??'Agent 正在处理…'); try { const result = await api<{ taskId: string }>(`/api/agents/${context.deviceId}/tasks`, { method: 'POST', body: JSON.stringify({ rootId: context.rootId, kind, payload }) }); wait(result.taskId, kind); } catch (e) { setTaskText((e as Error).message); } };
   return <section className="agent-panel"><div className="agent-title"><div><p className="eyebrow">LOCAL TOOL BRIDGE</p><h3>本地 Agent</h3></div><button onClick={async () => { const result = await api<{ code: string }>('/api/agent/pairing-codes', { method: 'POST' }); setPairCode(result.code); }}>生成配对码</button></div>{pairCode && <div className="pair-code">在 Agent enroll 中输入：<b>{pairCode}</b></div>}<div className="device-list">{devices.length === 0 ? <p>尚未配对设备。</p> : devices.map(device => <button className={device.id === context?.deviceId ? 'device selected-device' : 'device'} key={device.id} onClick={() => onContext({ deviceId: device.id, rootId: device.roots[0]?.id ?? '' })}><i className={device.status} />{device.name}<small>{device.version} · {device.status}</small></button>)}</div>{selected && <div className="agent-task"><select value={context?.rootId} onChange={e => onContext({ deviceId: selected.id, rootId: e.target.value })}>{selected.roots.map(root => <option value={root.id} key={root.id}>{root.label}</option>)}</select><button onClick={() => task('select_root', {})}>更换本地目录</button><input value={relativePath} onChange={e => setRelativePath(e.target.value)} placeholder="相对路径，例如 src/lcd.c" /><button onClick={() => task('read_file', { relativePath })}>受控读取文件</button>{taskText && <pre>{taskText}</pre>}</div>}</section>;
 }
 
@@ -66,8 +66,9 @@ function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onAppr
 }
 
 function App() {
-  const [user, setUser] = useState<User | null>(null); const [conversations, setConversations] = useState<Conversation[]>([]); const [active, setActive] = useState<Conversation | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [requirement, setRequirement] = useState(''); const [files, setFiles] = useState<File[]>([]); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [agentContext, setAgentContext] = useState<AgentContext | null>(null); const [traces, setTraces] = useState<Trace[]>([]); const [approvalStatus, setApprovalStatus] = useState<Record<string, string>>({});
+  const [user, setUser] = useState<User | null>(null); const [conversations, setConversations] = useState<Conversation[]>([]); const [active, setActive] = useState<Conversation | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [requirement, setRequirement] = useState(''); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [agentContext, setAgentContext] = useState<AgentContext | null>(null); const [traces, setTraces] = useState<Trace[]>([]); const [approvalStatus, setApprovalStatus] = useState<Record<string, string>>({});
   const loadConversations = async () => { const result = await api<{ conversations: Conversation[] }>('/api/conversations'); setConversations(result.conversations); };
+  const del = async (conversation: Conversation) => { if (!confirm(`删除对话“${conversation.title}”？此操作不可恢复。`)) return; try { await api(`/api/conversations/${conversation.id}`, { method: 'DELETE' }); if (active?.id === conversation.id) { setActive(null); setMessages([]); setTraces([]); } loadConversations(); } catch (e) { setError((e as Error).message); } };
   const open = async (conversation: Conversation) => { const result = await api<{ messages: Message[] }>(`/api/conversations/${conversation.id}`); setActive(conversation); setMessages(result.messages); setTraces([]); };
   useEffect(() => { api<{ user: User | null }>('/api/auth/me').then(result => { setUser(result.user); if (result.user) loadConversations(); }); }, []);
   if (!user) return <Login onLogin={next => { setUser(next); loadConversations(); }} />;
@@ -75,8 +76,8 @@ function App() {
   const approve = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '写入中' })); try { await api(`/api/agent-tasks/${taskId}/approve`, { method: 'POST' }); poll(taskId); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
   const reject = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '拒绝中' })); try { await api(`/api/agent-tasks/${taskId}/reject`, { method: 'POST' }); setApprovalStatus(current => ({ ...current, [taskId]: '已拒绝' })); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
 
-  const send = async () => {
-    if (!requirement.trim() || busy) return; setBusy(true); setError(''); const prompt = requirement; setRequirement('');
+  const send = async (initial?: string) => {
+    const prompt = (initial ?? requirement).trim(); if (!prompt || busy) return; setBusy(true); setError(''); setRequirement('');
     try {
       let current = active; if (!current) { const result = await api<{ conversation: Conversation }>('/api/conversations', { method: 'POST', body: JSON.stringify({ title: prompt.slice(0, 30) }) }); current = result.conversation; setActive(current); loadConversations(); }
       setMessages(existing => [...existing, { id: crypto.randomUUID(), role: 'user', content: prompt }]);
@@ -98,7 +99,7 @@ function App() {
           } else if (event === 'complete') {
             resultTraces = data.toolTrace ?? resultTraces; setTraces(resultTraces);
             const g = data.generation;
-            const text = `## 分析\n${g.analysis}\n\n## 建议\n${g.suggestion}\n\n## 代码草案\n\`\`\`c\n${g.code}\n\`\`\`\n\n## 注意事项\n${g.cautions.map((item: string) => `- ${item}`).join('\n')}`;
+            const text = g.suggestion;
             setMessages(existing => existing.map(m => m.id === assistantId ? { ...m, content: text } : m));
           } else if (event === 'error') throw new Error(data.error);
         };
@@ -112,8 +113,53 @@ function App() {
     } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   };
 
+  const suggestions = (agentContext ? [
+    { icon: '📁', title: '查看项目结构', prompt: '先查看一下当前项目的文件结构，并给我一个项目概览。' },
+    { icon: '📖', title: '解释核心代码', prompt: '读取项目中的主要源码，解释它们的职责和关键逻辑。' },
+    { icon: '🛠️', title: '帮我改代码', prompt: '检查当前项目代码，找出可以改进的地方并给出修改建议。' },
+    { icon: '✨', title: '新增功能', prompt: '在当前项目里新增一个小功能模块，并给出完整的改动补丁。' },
+  ] : [
+    { icon: '💻', title: '生成组件', prompt: '用 React 写一个带搜索框的表格组件示例。' },
+    { icon: '🐍', title: '数据处理', prompt: '用 Python 写一个读取并分析 CSV 文件的脚本。' },
+    { icon: '🔍', title: '解释代码', prompt: '用通俗易懂的方式解释一段复杂的代码。' },
+    { icon: '📐', title: '项目规划', prompt: '帮我规划一个 Web 项目的基本目录和模块划分。' },
+  ]);
   const pending = traces.filter(trace => trace.name === 'stage_patch' && trace.result?.status === 'awaiting_approval' && !approvalStatus[String(trace.result.taskId)]);
-  return <div className="shell"><aside><div className="brand">企业 AI 编程助手</div><button className="new" onClick={() => { setActive(null); setMessages([]); setTraces([]); }}>+ 新建对话</button><div className="history">{conversations.map(conversation => <button key={conversation.id} onClick={() => open(conversation)} className={active?.id === conversation.id ? 'selected' : ''}>{conversation.title}</button>)}</div><AgentPanel context={agentContext} onContext={setAgentContext} /><div className="account"><span>{user.username}</span><button onClick={async () => { await api('/api/auth/logout', { method: 'POST' }); setUser(null); }}>退出</button></div></aside><main className="chat"><header><div><p className="eyebrow">SERVER LLM AGENT</p><h2>{active?.title ?? '新建代码草案'}</h2></div><span className="badge">{agentContext ? '已连接本地工程工具' : '仅生成草案'}</span></header><section className="messages">{messages.length === 0 && <div className="empty"><h3>描述你希望完成的工程任务</h3><p>选择本地 Agent 后，服务端 LLM 可以读取并修改授权工程。</p></div>}{messages.map(message => <article key={message.id} className={message.role}><div className="role">{message.role === 'user' ? '你' : 'AI Agent'}</div><pre>{message.content}</pre></article>)}{traces.map((trace, index) => <ToolCard key={`${trace.name}-${index}`} trace={trace} status={trace.result?.taskId ? approvalStatus[String(trace.result.taskId)] : undefined} onApprove={() => approve(String(trace.result.taskId))} onReject={() => reject(String(trace.result.taskId))} />)}</section>{pending.length > 0 && <div className="approval-list"><p>以下补丁等待你的确认，确认后才会写入本地工程。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>确认写入补丁</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}<footer><label className="upload">上传源码<input type="file" multiple accept=".c,.h,.txt,.md" onChange={event => setFiles(Array.from(event.target.files ?? []))} /><span>{files.length ? `已选 ${files.length} 个文件` : '支持 .c / .h / .txt / .md'}</span></label><textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder={agentContext ? '描述要让 Agent 读取或修改的本地工程任务…' : '描述你希望生成的代码草案…'} /><div className="sendrow">{error && <span className="error">{error}</span>}<button disabled={busy || !requirement.trim()} onClick={send}>{busy ? (agentContext ? 'Agent 工作中…' : '正在生成…') : (agentContext ? '运行 Agent' : '生成代码草案')}</button></div></footer></main></div>;
+  return (
+    <div className="shell">
+      <aside>
+        <div className="brand">企业 AI 编程助手</div>
+        <button className="new" onClick={() => { setActive(null); setMessages([]); setTraces([]); }}><span className="new-icon">+</span>新建对话</button>
+        <p className="history-title">历史记录</p>
+        <div className="history">{conversations.map(conversation => <div className="history-item" key={conversation.id}><button className={active?.id === conversation.id ? 'selected' : ''} onClick={() => open(conversation)}>{conversation.title}</button><button className="history-del" title="删除对话" onClick={event => { event.stopPropagation(); del(conversation); }}>删除</button></div>)}</div>
+        <AgentPanel context={agentContext} onContext={setAgentContext} />
+        <div className="account"><span>{user.username}</span><button onClick={async () => { await api('/api/auth/logout', { method: 'POST' }); setUser(null); }}>退出</button></div>
+      </aside>
+      <main className="chat">
+        {active && <header><div><p className="eyebrow">SERVER LLM AGENT</p><h2>{active.title}</h2></div><span className="badge">{agentContext ? '已连接本地工程工具' : '仅生成草案'}</span></header>}
+        <section className="messages">
+          {messages.length === 0 && <div className="empty">
+            <div className="empty-icon">💻</div>
+            <h2>有什么可以帮你的？</h2>
+            {agentContext && <span className="empty-badge">已连接本地工程工具</span>}
+            <p>{agentContext ? 'AI 助手已连接你的本地 Agent，可以读取并修改你授权的工程项目。' : '描述你想完成的工程任务，AI 助手会为你生成方案和代码。'}</p>
+            <div className="suggestions">{suggestions.map(s => <button key={s.title} className="suggestion" onClick={() => send(s.prompt)}><span className="suggestion-icon">{s.icon}</span><span className="suggestion-text"><strong>{s.title}</strong><small>{s.prompt}</small></span></button>)}</div>
+            <div className="empty-input">
+              <textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder={agentContext ? '描述要让 Agent 读取或修改的本地工程任务…' : '描述你希望生成的代码草案…'} />
+              <div className="sendrow">{error && <span className="error">{error}</span>}<span className="busy-hint">{busy ? (agentContext ? 'Agent 工作中…' : '正在生成…') : ''}</span><button className="send-btn" disabled={busy || !requirement.trim()} onClick={() => send()} title={busy ? '处理中' : '发送'}>{busy ? <span className="spinner" /> : '↑'}</button></div>
+            </div>
+          </div>}
+          {messages.map(message => <article key={message.id} className={message.role}><div className="role">{message.role === 'user' ? '你' : 'AI Agent'}</div><pre>{message.content}</pre></article>)}
+          {traces.map((trace, index) => <ToolCard key={`${trace.name}-${index}`} trace={trace} status={trace.result?.taskId ? approvalStatus[String(trace.result.taskId)] : undefined} onApprove={() => approve(String(trace.result.taskId))} onReject={() => reject(String(trace.result.taskId))} />)}
+        </section>
+        {pending.length > 0 && <div className="approval-list"><p>以下补丁等待你的确认，确认后才会写入本地工程。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>确认写入补丁</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}
+        {messages.length > 0 && <footer>
+          <textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder={agentContext ? '描述要让 Agent 读取或修改的本地工程任务…' : '描述你希望生成的代码草案…'} />
+          <div className="sendrow">{error && <span className="error">{error}</span>}<span className="busy-hint">{busy ? (agentContext ? 'Agent 工作中…' : '正在生成…') : ''}</span><button className="send-btn" disabled={busy || !requirement.trim()} onClick={() => send()} title={busy ? '处理中' : '发送'}>{busy ? <span className="spinner" /> : '↑'}</button></div>
+        </footer>}
+      </main>
+    </div>
+  );
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

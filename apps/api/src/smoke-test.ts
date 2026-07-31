@@ -28,6 +28,7 @@ const created = await app.inject({ method: 'POST', url: '/api/conversations', he
 if (created.statusCode !== 200) throw new Error(`创建会话失败：${created.body}`);
 const conversationId = created.json().conversation.id;
 const generated = await app.inject({ method: 'POST', url: `/api/conversations/${conversationId}/messages`, headers: { cookie }, payload: { requirement: '添加 LCD 冒号闪烁', fileIds: [] } });
-if (generated.statusCode !== 200 || !generated.json().message.content.includes('代码草案')) throw new Error(`生成失败：${generated.body}`);
+const generatedBody = generated.json();
+if (generated.statusCode !== 200 || !generatedBody.message?.content?.trim()) throw new Error(`生成失败：${generated.body}`);
 console.log('API smoke test passed');
 await app.close();
