@@ -89,7 +89,7 @@ app.post('/api/conversations/:id/messages', async (request, reply) => {
 
 app.post('/api/agent-runs', async (request, reply) => {
   const user = requireUser(request, reply); if (!user) return;
-  const body = z.object({ requirement:z.string().min(1).max(10000), deviceId:z.string().uuid(), rootId:z.string().uuid(), sources:z.array(z.object({name:z.string(),content:z.string()})).max(20).default([]) }).safeParse(request.body);
+  const body = z.object({ requirement:z.string().min(1).max(10000), deviceId:z.string().uuid(), rootId:z.string().uuid(), conversationId:z.string().uuid().optional(), sources:z.array(z.object({name:z.string(),content:z.string()})).max(20).default([]) }).safeParse(request.body);
   if (!body.success) return reply.code(400).send({error:'Agent run 参数无效'});
   if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(body.data.deviceId,user.id)) return reply.code(404).send({error:'设备不存在'});
   if (!db.prepare('SELECT 1 FROM device_roots WHERE id=? AND device_id=?').get(body.data.rootId,body.data.deviceId)) return reply.code(400).send({error:'项目根目录无效'});
@@ -104,9 +104,34 @@ app.post('/api/agent-runs', async (request, reply) => {
       const task=dispatchAgentTask(user.id,body.data.deviceId,body.data.rootId,safeCall.name,safeCall.arguments);
       return { taskId:task.taskId, ...(await task.result) };
     }, 8, (call,result) => toolTrace.push({name:call.name,result}));
+    if (body.data.conversationId && db.prepare('SELECT 1 FROM conversations WHERE id=? AND user_id=?').get(body.data.conversationId, user.id)) {
+      const userMessageId = id(); const assistantMessageId = id(); const content = renderGeneration(generation);
+      db.prepare('INSERT OR IGNORE INTO messages (id,conversation_id,role,content,metadata,created_at) VALUES (?,?,?,?,?,?)').run(userMessageId, body.data.conversationId, 'user', body.data.requirement, JSON.stringify({ agent: true }), now());
+      db.prepare('INSERT INTO messages (id,conversation_id,role,content,metadata,created_at) VALUES (?,?,?,?,?,?)').run(assistantMessageId, body.data.conversationId, 'assistant', content, JSON.stringify({ agent: true, toolTrace }), now());
+      db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(now(), body.data.conversationId);
+    }
     audit(user.id,'agent_run_completed',{deviceId:body.data.deviceId,rootId:body.data.rootId});
     return { generation, toolTrace };
   } catch (error) { audit(user.id,'agent_run_failed',{reason:error instanceof Error ? error.message : 'unknown'}); return reply.code(500).send({error:'Agent run 失败'}); }
+});
+
+app.post('/api/agent-runs/stream', async (request, reply) => {
+  const user = requireUser(request, reply); if (!user) return;
+  const body = z.object({ requirement:z.string().min(1).max(10000), deviceId:z.string().uuid(), rootId:z.string().uuid(), conversationId:z.string().uuid().optional(), sources:z.array(z.object({name:z.string(),content:z.string()})).max(20).default([]) }).safeParse(request.body);
+  if (!body.success) return reply.code(400).send({ error: 'Agent run 参数无效' });
+  if (!db.prepare('SELECT 1 FROM devices WHERE id=? AND user_id=?').get(body.data.deviceId,user.id)) return reply.code(404).send({ error: '设备不存在' });
+  if (!db.prepare('SELECT 1 FROM device_roots WHERE id=? AND device_id=?').get(body.data.rootId,body.data.deviceId)) return reply.code(400).send({ error: '项目根目录无效' });
+  const agentProvider = provider as Partial<import('./model.js').AgentModelProvider>;
+  if (typeof agentProvider.plan !== 'function') return reply.code(503).send({ error: '当前模型不支持 Agent 工具调用' });
+  reply.hijack(); reply.raw.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  const send = (event: string, data: unknown) => reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  try {
+    send('start', { conversationId: body.data.conversationId });
+    const codeStyle = readFileSync(config.codeStylePath,'utf8'); const toolTrace:Array<{name:string;result:unknown}> = [];
+    const generation = await runServerAgent(agentProvider as import('./model.js').AgentModelProvider, { requirement:body.data.requirement, codeStyle, sources:body.data.sources }, async call => { const safeCall = validateAgentToolCall(call); const task = dispatchAgentTask(user.id, body.data.deviceId, body.data.rootId, safeCall.name, safeCall.arguments); const result = { taskId: task.taskId, ...(await task.result) }; return result; }, 8, (call,result) => { toolTrace.push({ name:call.name, result }); send('tool', { name:call.name, result }); }, delta => send('token', { text: delta }));
+    if (body.data.conversationId && db.prepare('SELECT 1 FROM conversations WHERE id=? AND user_id=?').get(body.data.conversationId,user.id)) { const created = now(); db.prepare('INSERT OR IGNORE INTO messages (id,conversation_id,role,content,metadata,created_at) VALUES (?,?,?,?,?,?)').run(id(),body.data.conversationId,'user',body.data.requirement,JSON.stringify({agent:true}),created); db.prepare('INSERT INTO messages (id,conversation_id,role,content,metadata,created_at) VALUES (?,?,?,?,?,?)').run(id(),body.data.conversationId,'assistant',renderGeneration(generation),JSON.stringify({agent:true,toolTrace}),now()); db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(now(),body.data.conversationId); }
+    send('complete', { generation, toolTrace }); audit(user.id,'agent_run_completed',{deviceId:body.data.deviceId,rootId:body.data.rootId});
+  } catch (error) { send('error', { error: error instanceof Error ? error.message : 'Agent run failed' }); audit(user.id,'agent_run_failed',{reason:error instanceof Error ? error.message : 'unknown'}); } finally { send('done', {}); reply.raw.end(); }
 });
 
 app.post('/api/agent/pairing-codes', async (request, reply) => { const user = requireUser(request, reply); if (!user) return; const code = randomBytes(9).toString('base64url'); const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString(); db.prepare('INSERT INTO pairing_codes (id,user_id,code_hash,expires_at,created_at) VALUES (?,?,?,?,?)').run(id(), user.id, sha(code), expiresAt, now()); audit(user.id, 'agent_pairing_code_created', { expiresAt }); return { code, expiresAt }; });

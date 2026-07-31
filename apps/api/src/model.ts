@@ -5,7 +5,7 @@ export type AgentToolName = 'list_files' | 'read_file' | 'stage_patch' | 'apply_
 export interface AgentToolCall { name: AgentToolName; arguments: Record<string, unknown>; }
 export interface AgentTurn { kind: 'tool_call' | 'final'; toolCall?: AgentToolCall; generation?: Generation; }
 export interface AgentToolInput extends ModelInput { toolResults?: Array<{ call: AgentToolCall; result: unknown }>; }
-export interface AgentModelProvider extends ModelProvider { plan(input: AgentToolInput): Promise<AgentTurn>; }
+export interface AgentModelProvider extends ModelProvider { plan(input: AgentToolInput, onDelta?: (delta: string) => void): Promise<AgentTurn>; }
 export type AgentToolExecutor = (call: AgentToolCall) => Promise<unknown>;
 
 const toolArgumentSchemas: Record<AgentToolName, z.ZodType<Record<string, unknown>>> = {
@@ -23,10 +23,10 @@ export function validateAgentToolCall(call: AgentToolCall): AgentToolCall {
   return { name: call.name, arguments: parsed.data };
 }
 
-export async function runAgentLoop(provider: AgentModelProvider, input: ModelInput, execute: AgentToolExecutor, maxTurns = 8, onTool?: (call: AgentToolCall, result: unknown) => void): Promise<Generation> {
+export async function runAgentLoop(provider: AgentModelProvider, input: ModelInput, execute: AgentToolExecutor, maxTurns = 8, onTool?: (call: AgentToolCall, result: unknown) => void, onDelta?: (delta: string) => void): Promise<Generation> {
   let toolResults: Array<{ call: AgentToolCall; result: unknown }> = [];
   for (let turn = 0; turn < maxTurns; turn += 1) {
-    const next = await provider.plan({ ...input, toolResults });
+    const next = await provider.plan({ ...input, toolResults }, onDelta);
     if (next.kind === 'final' && next.generation) return next.generation;
     if (next.kind !== 'tool_call' || !next.toolCall) throw new Error('模型返回了无效的工具调用');
     const call = validateAgentToolCall(next.toolCall);
@@ -57,7 +57,7 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
     return turn.generation;
   }
 
-  async plan(input: AgentToolInput): Promise<AgentTurn> {
+  async plan(input: AgentToolInput, onDelta?: (delta: string) => void): Promise<AgentTurn> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 90_000);
     let response: Response;
@@ -66,7 +66,7 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
       signal: controller.signal,
-      body: JSON.stringify({ model: this.model, temperature: 0.2, response_format: { type: 'json_object' }, messages: [
+      body: JSON.stringify({ model: this.model, temperature: 0.2, stream: Boolean(onDelta), response_format: { type: 'json_object' }, messages: [
         { role: 'system', content: `你是企业内部 C 代码 Agent。必须遵守以下规范：\n${input.codeStyle}\n你可以通过 list_files、read_file、stage_patch、apply_patch 工具直接操作授权工程；禁止请求 Shell、编译器或任意进程。所有写入仍由 Agent 校验路径、原文件哈希和企业写入策略。只返回 JSON：{"kind":"tool_call","toolCall":{"name":"read_file","arguments":{}}} 或 {"kind":"final","generation":{"analysis":string,"suggestion":string,"code":string,"cautions":string[]}}。` },
         { role: 'user', content: JSON.stringify({ requirement: input.requirement, sources: input.sources, toolResults: input.toolResults ?? [] }) }
       ] })
@@ -75,8 +75,11 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
       throw new Error(error instanceof Error && error.name === 'AbortError' ? '模型请求超时' : `模型网关连接失败: ${error instanceof Error ? error.message : 'unknown'}`);
     } finally { clearTimeout(timeout); }
     if (!response.ok) throw new Error(`模型网关请求失败：HTTP ${response.status}`);
-    const body = await response.json() as ChatResponse;
-    const content = body.choices?.[0]?.message?.content;
+    let content = '';
+    if (onDelta && response.body) {
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+      while (true) { const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true }); const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? ''; for (const line of lines) { if (!line.startsWith('data:')) continue; const value = line.slice(5).trim(); if (!value || value === '[DONE]') continue; try { const delta = (JSON.parse(value) as { choices?: Array<{ delta?: { content?: string } }> }).choices?.[0]?.delta?.content ?? ''; if (delta) { content += delta; onDelta(delta); } } catch { /* ignore incomplete gateway chunks */ } } }
+    } else { const body = await response.json() as ChatResponse; content = body.choices?.[0]?.message?.content ?? ''; }
     if (!content) throw new Error('模型网关未返回内容');
     const parsed = JSON.parse(content) as Partial<AgentTurn>;
     if (parsed.kind === 'tool_call' && parsed.toolCall) return { kind: 'tool_call', toolCall: validateAgentToolCall(parsed.toolCall as AgentToolCall) };
