@@ -10,6 +10,14 @@ type Device = { id: string; name: string; status: string; version: string; roots
 type AgentContext = { deviceId: string; rootId: string };
 type Trace = { name: string; result?: any };
 
+async function streamChat(conversationId: string, content: string, update: (text: string) => void) {
+  const response = await fetch('/api/chat/stream', { method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ conversationId, content }) });
+  if (!response.ok || !response.body) throw new Error((await response.json()).error ?? '聊天请求失败');
+  const reader=response.body.getReader(); const decoder=new TextDecoder(); let buffer=''; let answer='';
+  const consume=(block:string)=>{ const lines=block.split(/\r?\n/); const event=lines.find(line=>line.startsWith('event:'))?.slice(6).trim(); const dataLine=lines.find(line=>line.startsWith('data:'))?.slice(5).trim(); if(!dataLine)return; const data=JSON.parse(dataLine); if(event==='token'){answer+=data.text??'';update(answer);} if(event==='error')throw new Error(data.error); };
+  while(true){const chunk=await reader.read();if(chunk.done)break;buffer+=decoder.decode(chunk.value,{stream:true});const blocks=buffer.split('\n\n');buffer=blocks.pop()??'';blocks.forEach(consume);} if(buffer.trim())consume(buffer); return answer;
+}
+
 const api = async <T,>(url: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(url, { credentials: 'include', ...options, headers: { ...(options?.body instanceof FormData || options?.body === undefined ? {} : { 'Content-Type': 'application/json' }), ...options?.headers } });
   const data = await response.json();
@@ -32,23 +40,80 @@ function AgentPanel({ context, onContext }: { context: AgentContext | null; onCo
   return <section className="agent-panel"><div className="agent-title"><div><p className="eyebrow">LOCAL TOOL BRIDGE</p><h3>本地 Agent</h3></div><button onClick={async () => { const result = await api<{ code: string }>('/api/agent/pairing-codes', { method: 'POST' }); setPairCode(result.code); }}>生成配对码</button></div>{pairCode && <div className="pair-code">在 Agent enroll 中输入：<b>{pairCode}</b></div>}<div className="device-list">{devices.length === 0 ? <p>尚未配对设备。</p> : devices.map(device => <button className={device.id === context?.deviceId ? 'device selected-device' : 'device'} key={device.id} onClick={() => onContext({ deviceId: device.id, rootId: device.roots[0]?.id ?? '' })}><i className={device.status} />{device.name}<small>{device.version} · {device.status}</small></button>)}</div>{selected && <div className="agent-task"><select value={context?.rootId} onChange={e => onContext({ deviceId: selected.id, rootId: e.target.value })}>{selected.roots.map(root => <option value={root.id} key={root.id}>{root.label}</option>)}</select><button onClick={() => task('select_root', {})}>更换本地目录</button><input value={relativePath} onChange={e => setRelativePath(e.target.value)} placeholder="相对路径，例如 src/lcd.c" /><button onClick={() => task('read_file', { relativePath })}>受控读取文件</button>{taskText && <pre>{taskText}</pre>}</div>}</section>;
 }
 
-function DiffPreview({ trace, onApprove, onReject, status }: { trace: Trace; onApprove: () => void; onReject: () => void; status?: string }) {
-  const preview = trace.result?.preview; if (!preview) return null;
-  return <section className="diff-card"><div className="diff-header"><strong>{preview.relativePath ?? trace.result.relativePath}</strong><span>{status ?? '待确认'}</span></div><div className="diff-columns"><div><h4>修改前</h4><pre>{preview.before}</pre></div><div><h4>修改后</h4><pre>{preview.after}</pre></div></div>{!status && <div className="diff-actions"><button onClick={onApprove}>确认写入</button><button className="secondary" onClick={onReject}>拒绝</button></div>} {status && <p className="task-status">状态：{status}</p>}</section>;
+const TOOL_ICON: Record<string, string> = { list_files:'📂', read_file:'📄', stage_patch:'✏️', apply_patch:'✅' };
+const TOOL_LABEL: Record<string, string> = { list_files:'列出文件', read_file:'读取文件', stage_patch:'生成补丁', apply_patch:'写入补丁' };
+
+function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onApprove: () => void; onReject: () => void; status?: string }) {
+  const result = trace.result ?? {};
+  const preview = result.preview;
+  const file = preview?.relativePath ?? result.relativePath ?? '';
+  const isPatch = trace.name === 'stage_patch' && preview;
+  const isAwaiting = result.status === 'awaiting_approval';
+  const [expanded, setExpanded] = useState(false);
+  return <section className="tool-card">
+    <div className="tool-header" onClick={() => setExpanded(!expanded)}>
+      <span className="tool-icon">{TOOL_ICON[trace.name] ?? '🔧'}</span>
+      <strong>{TOOL_LABEL[trace.name] ?? trace.name}</strong>
+      {file && <span className="tool-file">{file}</span>}
+      <span className={`tool-status tool-status-${status??result.status??'completed'}`}>{status ?? result.status ?? '完成'}</span>
+    </div>
+    {(expanded || isPatch) && <div className="tool-body">
+      {isPatch ? <div className="diff-columns"><div><h4>修改前</h4><pre>{preview.before}</pre></div><div><h4>修改后</h4><pre>{preview.after}</pre></div></div> : <pre className="tool-result">{typeof result === 'string' ? result : JSON.stringify(result, null, 2)}</pre>}
+      {isPatch && !status && isAwaiting && <div className="diff-actions"><button onClick={onApprove}>确认写入</button><button className="secondary" onClick={onReject}>拒绝</button></div>}
+      {status && <p className="task-status">状态：{status}</p>}
+    </div>}
+  </section>;
 }
 
 function App() {
   const [user, setUser] = useState<User | null>(null); const [conversations, setConversations] = useState<Conversation[]>([]); const [active, setActive] = useState<Conversation | null>(null); const [messages, setMessages] = useState<Message[]>([]); const [requirement, setRequirement] = useState(''); const [files, setFiles] = useState<File[]>([]); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [agentContext, setAgentContext] = useState<AgentContext | null>(null); const [traces, setTraces] = useState<Trace[]>([]); const [approvalStatus, setApprovalStatus] = useState<Record<string, string>>({});
   const loadConversations = async () => { const result = await api<{ conversations: Conversation[] }>('/api/conversations'); setConversations(result.conversations); };
-  const open = async (conversation: Conversation) => { const result = await api<{ messages: Message[] }>(`/api/conversations/${conversation.id}`); setActive(conversation); setMessages(result.messages); };
+  const open = async (conversation: Conversation) => { const result = await api<{ messages: Message[] }>(`/api/conversations/${conversation.id}`); setActive(conversation); setMessages(result.messages); setTraces([]); };
   useEffect(() => { api<{ user: User | null }>('/api/auth/me').then(result => { setUser(result.user); if (result.user) loadConversations(); }); }, []);
   if (!user) return <Login onLogin={next => { setUser(next); loadConversations(); }} />;
   const poll = (taskId: string) => { const timer = setInterval(async () => { try { const detail = await api<{ task: { status: string } }>(`/api/agent-tasks/${taskId}`); if (['completed', 'failed', 'rejected', 'expired'].includes(detail.task.status)) { clearInterval(timer); setApprovalStatus(current => ({ ...current, [taskId]: detail.task.status })); } } catch { clearInterval(timer); } }, 1000); };
   const approve = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '写入中' })); try { await api(`/api/agent-tasks/${taskId}/approve`, { method: 'POST' }); poll(taskId); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
   const reject = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '拒绝中' })); try { await api(`/api/agent-tasks/${taskId}/reject`, { method: 'POST' }); setApprovalStatus(current => ({ ...current, [taskId]: '已拒绝' })); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
-  const send = async () => { if (!requirement.trim() || busy) return; setBusy(true); setError(''); const prompt = requirement; try { let current = active; if (!current) { const result = await api<{ conversation: Conversation }>('/api/conversations', { method: 'POST', body: JSON.stringify({ title: prompt.slice(0, 30) }) }); current = result.conversation; setActive(current); loadConversations(); } setMessages(existing => [...existing, { id: crypto.randomUUID(), role: 'user', content: prompt }]); if (agentContext) { const assistantId = crypto.randomUUID(); setMessages(existing => [...existing, { id: assistantId, role: 'assistant', content: '模型正在输出…' }]); const response = await fetch('/api/agent-runs/stream', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requirement: prompt, deviceId: agentContext.deviceId, rootId: agentContext.rootId, conversationId: current.id, sources: [] }) }); if (!response.ok || !response.body) throw new Error((await response.json()).error ?? '流式请求失败'); const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let streamed = ''; let resultTraces: Trace[] = []; const consume = (block: string) => { const lines = block.split(/\r?\n/); const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim(); const dataLine = lines.find(line => line.startsWith('data:'))?.slice(5).trim(); if (!dataLine) return; const data = JSON.parse(dataLine); if (event === 'token') { streamed += data.text ?? ''; setMessages(existing => existing.map(message => message.id === assistantId ? { ...message, content: streamed } : message)); } else if (event === 'tool') { resultTraces = [...resultTraces, data]; setTraces(resultTraces); } else if (event === 'complete') { resultTraces = data.toolTrace ?? resultTraces; setTraces(resultTraces); const generation = data.generation; streamed = `## 分析\n${generation.analysis}\n\n## 建议\n${generation.suggestion}\n\n## 代码草案\n${generation.code}\n\n## 注意事项\n${generation.cautions.map((item: string) => `- ${item}`).join('\n')}`; setMessages(existing => existing.map(message => message.id === assistantId ? { ...message, content: streamed } : message)); } else if (event === 'error') throw new Error(data.error); }; while (true) { const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true }); const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? ''; blocks.forEach(consume); } if (buffer.trim()) consume(buffer); } else { let fileIds: string[] = []; if (files.length) { const form = new FormData(); files.forEach(file => form.append('files', file)); const result = await api<{ files: { id: string }[] }>('/api/files', { method: 'POST', body: form }); fileIds = result.files.map(file => file.id); } const result = await api<{ message: Message }>(`/api/conversations/${current.id}/messages`, { method: 'POST', body: JSON.stringify({ requirement: prompt, fileIds }) }); setMessages(existing => [...existing, result.message]); setFiles([]); } setRequirement(''); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
+
+  const send = async () => {
+    if (!requirement.trim() || busy) return; setBusy(true); setError(''); const prompt = requirement; setRequirement('');
+    try {
+      let current = active; if (!current) { const result = await api<{ conversation: Conversation }>('/api/conversations', { method: 'POST', body: JSON.stringify({ title: prompt.slice(0, 30) }) }); current = result.conversation; setActive(current); loadConversations(); }
+      setMessages(existing => [...existing, { id: crypto.randomUUID(), role: 'user', content: prompt }]);
+      if (agentContext) {
+        const assistantId = crypto.randomUUID();
+        setMessages(existing => [...existing, { id: assistantId, role: 'assistant', content: '思考中…' }]);
+        const response = await fetch('/api/agent-runs/stream', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requirement: prompt, deviceId: agentContext.deviceId, rootId: agentContext.rootId, conversationId: current.id, sources: [] }) });
+        if (!response.ok || !response.body) throw new Error((await response.json()).error ?? '流式请求失败');
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let resultTraces: Trace[] = []; let toolIdx = 0;
+        const consume = (block: string) => {
+          const lines = block.split(/\r?\n/); const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim(); const dataLine = lines.find(line => line.startsWith('data:'))?.slice(5).trim(); if (!dataLine) return;
+          const data = JSON.parse(dataLine);
+          if (event === 'token') {
+            toolIdx += 1;
+            setMessages(existing => existing.map(m => m.id === assistantId ? { ...m, content: toolIdx === 1 ? '正在分析需求…' : `正在调用工具 (第 ${toolIdx} 轮)…` } : m));
+          } else if (event === 'tool') {
+            resultTraces = [...resultTraces, data]; setTraces(resultTraces);
+            setMessages(existing => existing.map(m => m.id === assistantId ? { ...m, content: `执行 ${TOOL_LABEL[data.name] ?? data.name}…` } : m));
+          } else if (event === 'complete') {
+            resultTraces = data.toolTrace ?? resultTraces; setTraces(resultTraces);
+            const g = data.generation;
+            const text = `## 分析\n${g.analysis}\n\n## 建议\n${g.suggestion}\n\n## 代码草案\n\`\`\`c\n${g.code}\n\`\`\`\n\n## 注意事项\n${g.cautions.map((item: string) => `- ${item}`).join('\n')}`;
+            setMessages(existing => existing.map(m => m.id === assistantId ? { ...m, content: text } : m));
+          } else if (event === 'error') throw new Error(data.error);
+        };
+        while (true) { const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true }); const blocks = buffer.split('\n\n'); buffer = blocks.pop() ?? ''; blocks.forEach(consume); }
+        if (buffer.trim()) consume(buffer);
+      } else {
+        const assistantId = crypto.randomUUID();
+        setMessages(existing => [...existing, { id: assistantId, role: 'assistant', content: '' }]);
+        await streamChat(current.id, prompt, (text) => { setMessages(existing => existing.map(m => m.id === assistantId ? { ...m, content: text } : m)); });
+      }
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+
   const pending = traces.filter(trace => trace.name === 'stage_patch' && trace.result?.status === 'awaiting_approval' && !approvalStatus[String(trace.result.taskId)]);
-  return <div className="shell"><aside><div className="brand">企业 AI 编程助手</div><button className="new" onClick={() => { setActive(null); setMessages([]); setTraces([]); }}>+ 新建对话</button><div className="history">{conversations.map(conversation => <button key={conversation.id} onClick={() => open(conversation)} className={active?.id === conversation.id ? 'selected' : ''}>{conversation.title}</button>)}</div><AgentPanel context={agentContext} onContext={setAgentContext} /><div className="account"><span>{user.username}</span><button onClick={async () => { await api('/api/auth/logout', { method: 'POST' }); setUser(null); }}>退出</button></div></aside><main className="chat"><header><div><p className="eyebrow">SERVER LLM AGENT</p><h2>{active?.title ?? '新建代码草案'}</h2></div><span className="badge">{agentContext ? '已连接本地工程工具' : '仅生成草案'}</span></header><section className="messages">{messages.length === 0 && <div className="empty"><h3>描述你希望完成的工程任务</h3><p>选择本地 Agent 后，服务端 LLM 可以读取并修改授权工程。</p></div>}{messages.map(message => <article key={message.id} className={message.role}><div className="role">{message.role === 'user' ? '你' : 'AI Agent'}</div><pre>{message.content}</pre></article>)}{traces.map((trace, index) => <DiffPreview key={`${trace.name}-${index}`} trace={trace} status={trace.result?.taskId ? approvalStatus[String(trace.result.taskId)] : undefined} onApprove={() => approve(String(trace.result.taskId))} onReject={() => reject(String(trace.result.taskId))} />)}</section>{pending.length > 0 && <div className="approval-list"><p>以下补丁等待你的确认，确认后才会写入本地工程。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>确认写入补丁</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}<footer><label className="upload">上传源码<input type="file" multiple accept=".c,.h,.txt,.md" onChange={event => setFiles(Array.from(event.target.files ?? []))} /><span>{files.length ? `已选 ${files.length} 个文件` : '支持 .c / .h / .txt / .md'}</span></label><textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder={agentContext ? '描述要让 Agent 读取或修改的本地工程任务…' : '描述你希望生成的代码草案…'} /><div className="sendrow">{error && <span className="error">{error}</span>}<button disabled={busy || !requirement.trim()} onClick={send}>{busy ? (agentContext ? 'Agent 工作中…' : '正在生成…') : (agentContext ? '运行 Agent' : '生成代码草案')}</button></div></footer></main></div>;
+  return <div className="shell"><aside><div className="brand">企业 AI 编程助手</div><button className="new" onClick={() => { setActive(null); setMessages([]); setTraces([]); }}>+ 新建对话</button><div className="history">{conversations.map(conversation => <button key={conversation.id} onClick={() => open(conversation)} className={active?.id === conversation.id ? 'selected' : ''}>{conversation.title}</button>)}</div><AgentPanel context={agentContext} onContext={setAgentContext} /><div className="account"><span>{user.username}</span><button onClick={async () => { await api('/api/auth/logout', { method: 'POST' }); setUser(null); }}>退出</button></div></aside><main className="chat"><header><div><p className="eyebrow">SERVER LLM AGENT</p><h2>{active?.title ?? '新建代码草案'}</h2></div><span className="badge">{agentContext ? '已连接本地工程工具' : '仅生成草案'}</span></header><section className="messages">{messages.length === 0 && <div className="empty"><h3>描述你希望完成的工程任务</h3><p>选择本地 Agent 后，服务端 LLM 可以读取并修改授权工程。</p></div>}{messages.map(message => <article key={message.id} className={message.role}><div className="role">{message.role === 'user' ? '你' : 'AI Agent'}</div><pre>{message.content}</pre></article>)}{traces.map((trace, index) => <ToolCard key={`${trace.name}-${index}`} trace={trace} status={trace.result?.taskId ? approvalStatus[String(trace.result.taskId)] : undefined} onApprove={() => approve(String(trace.result.taskId))} onReject={() => reject(String(trace.result.taskId))} />)}</section>{pending.length > 0 && <div className="approval-list"><p>以下补丁等待你的确认，确认后才会写入本地工程。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>确认写入补丁</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}<footer><label className="upload">上传源码<input type="file" multiple accept=".c,.h,.txt,.md" onChange={event => setFiles(Array.from(event.target.files ?? []))} /><span>{files.length ? `已选 ${files.length} 个文件` : '支持 .c / .h / .txt / .md'}</span></label><textarea value={requirement} onChange={event => setRequirement(event.target.value)} placeholder={agentContext ? '描述要让 Agent 读取或修改的本地工程任务…' : '描述你希望生成的代码草案…'} /><div className="sendrow">{error && <span className="error">{error}</span>}<button disabled={busy || !requirement.trim()} onClick={send}>{busy ? (agentContext ? 'Agent 工作中…' : '正在生成…') : (agentContext ? '运行 Agent' : '生成代码草案')}</button></div></footer></main></div>;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

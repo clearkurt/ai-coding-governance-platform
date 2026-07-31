@@ -14,6 +14,7 @@ export const config = {
   uploadDir: resolve(dataPath, 'uploads'),
   databasePath: resolve(dataPath, 'platform.sqlite'),
   codeStylePath: resolve(projectRoot, 'knowledge', 'code-style.md'),
+  agentPromptPath: resolve(projectRoot, 'knowledge', 'agent-prompt.md'),
   webDistPath: resolve(projectRoot, 'apps', 'web', 'dist'),
   llmBaseUrl: process.env.LLM_BASE_URL ?? '',
   llmApiKey: process.env.LLM_API_KEY ?? '',

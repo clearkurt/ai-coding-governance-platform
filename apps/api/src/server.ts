@@ -18,7 +18,7 @@ import { runServerAgent } from './agent-runner.js';
 
 const allowedExtensions = new Set(['.c', '.h', '.txt', '.md']);
 const provider: ModelProvider = config.llmBaseUrl && config.llmApiKey && process.env.NODE_ENV !== 'test'
-  ? new OpenAICompatibleProvider(config.llmBaseUrl, config.llmApiKey, config.llmModel)
+  ? new OpenAICompatibleProvider(config.llmBaseUrl, config.llmApiKey, config.llmModel, config.agentPromptPath)
   : new MockModelProvider();
 const app = Fastify({ logger: true });
 await app.register(cookie);
@@ -55,6 +55,20 @@ app.post('/api/auth/login', async (request, reply) => {
 });
 app.post('/api/auth/logout', async (request, reply) => { logout(readSession(request.cookies.session)); reply.clearCookie('session', { path: '/' }); return { ok: true }; });
 app.get('/api/auth/me', async (request) => ({ user: userOf(request) ?? null }));
+
+app.post('/api/chat/stream', async (request, reply) => {
+  const user = requireUser(request, reply); if (!user) return;
+  const body = z.object({ conversationId:z.string().uuid(), content:z.string().min(1).max(10000) }).safeParse(request.body);
+  if (!body.success) return reply.code(400).send({ error: '聊天消息无效' });
+  if (!db.prepare('SELECT 1 FROM conversations WHERE id=? AND user_id=?').get(body.data.conversationId, user.id)) return reply.code(404).send({ error: '会话不存在' });
+  const chatProvider = provider as ModelProvider & { chat?: (messages: Array<{role:'user'|'assistant';content:string}>, onDelta?: (delta:string)=>void) => Promise<string> };
+  if (typeof chatProvider.chat !== 'function') return reply.code(503).send({ error: '当前模型未配置原生聊天接口' });
+  const history = db.prepare("SELECT role,content FROM messages WHERE conversation_id=? AND role IN ('user','assistant') ORDER BY created_at").all(body.data.conversationId) as Array<{role:'user'|'assistant';content:string}>;
+  db.prepare('INSERT INTO messages (id,conversation_id,role,content,created_at) VALUES (?,?,?,?,?)').run(id(), body.data.conversationId, 'user', body.data.content, now());
+  reply.hijack(); reply.raw.writeHead(200, { 'content-type':'text/event-stream; charset=utf-8', 'cache-control':'no-cache', connection:'keep-alive' });
+  const send = (event:string, data:unknown) => reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  try { let answer = ''; await chatProvider.chat([...history, { role:'user', content:body.data.content }], delta => { answer += delta; send('token', { text:delta }); }); db.prepare('INSERT INTO messages (id,conversation_id,role,content,created_at) VALUES (?,?,?,?,?)').run(id(), body.data.conversationId, 'assistant', answer, now()); db.prepare('UPDATE conversations SET updated_at=? WHERE id=?').run(now(), body.data.conversationId); send('complete', { content:answer }); } catch (error) { send('error', { error:error instanceof Error ? error.message : '聊天失败' }); } finally { send('done', {}); reply.raw.end(); }
+});
 
 app.post('/api/files', async (request, reply) => {
   const user = requireUser(request, reply); if (!user) return;
