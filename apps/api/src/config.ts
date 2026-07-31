@@ -1,9 +1,10 @@
-import 'dotenv/config';
+import { config as loadDotenv } from 'dotenv';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const dataPath = process.env.DATA_DIR ? resolve(process.env.DATA_DIR) : resolve(projectRoot, 'data');
+loadDotenv({ path: resolve(projectRoot, '.env') });
+const dataPath = process.env.DATA_DIR ? (isAbsolute(process.env.DATA_DIR) ? process.env.DATA_DIR : resolve(projectRoot, process.env.DATA_DIR)) : resolve(projectRoot, 'data');
 
 export const config = {
   port: Number(process.env.PORT ?? 3000),
