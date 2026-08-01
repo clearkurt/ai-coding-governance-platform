@@ -20,6 +20,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS agent_task_events (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES agent_tasks(id), status TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS agent_releases (id TEXT PRIMARY KEY, version TEXT NOT NULL UNIQUE, download_url TEXT NOT NULL, sha256 TEXT NOT NULL, signature TEXT NOT NULL, min_protocol INTEGER NOT NULL, published_at TEXT NOT NULL);
 `);
+const conversationColumns = db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;
+if (!conversationColumns.some(column => column.name === 'root_id')) {
+  db.exec('ALTER TABLE conversations ADD COLUMN root_id TEXT');
+}
 
 export const id = () => crypto.randomUUID();
 export const now = () => new Date().toISOString();
