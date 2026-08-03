@@ -34,8 +34,8 @@ function AgentPanel({ context, onContext, devices, locked }: { context: AgentCon
   return <section className="agent-panel"><div className="agent-title"><div><p className="eyebrow">LOCAL TOOL BRIDGE</p><h3>本地 Agent</h3></div><button onClick={async () => { const result = await api<{ code: string }>('/api/agent/pairing-codes', { method: 'POST' }); setPairCode(result.code); }}>生成配对码</button></div>{pairCode && <div className="pair-code">在 Agent enroll 中输入：<b>{pairCode}</b></div>}<div className="device-list">{devices.length === 0 ? <p>尚未配对设备。</p> : devices.map(device => <button className={device.id === context?.deviceId ? 'device selected-device' : 'device'} key={device.id} disabled={locked} onClick={() => onContext({ deviceId: device.id, rootId: device.roots[0]?.id ?? '' })}><i className={device.status} />{device.name}<small>{device.version} · {device.status}</small></button>)}</div>{selected && <div className="agent-task"><select value={context?.rootId} disabled={locked} onChange={e => onContext({ deviceId: selected.id, rootId: e.target.value })}>{selected.roots.map(root => <option value={root.id} key={root.id}>{root.label}</option>)}</select><button disabled={locked} onClick={() => task('select_root', {})}>更换本地目录</button>{locked && <p className="agent-locked-hint">该对话已绑定项目，切换项目请新建对话</p>}<p className="agent-hint">选中目录后，AI 可自动访问其中的所有文件（.env、私钥等敏感文件除外）</p>{taskText && <pre>{taskText}</pre>}</div>}</section>;
 }
 
-const TOOL_ICON: Record<string, string> = { list_files:'📂', read_file:'📄', stage_patch:'✏️', apply_patch:'✅' };
-const TOOL_LABEL: Record<string, string> = { list_files:'列出文件', read_file:'读取文件', stage_patch:'生成补丁', apply_patch:'写入补丁' };
+const TOOL_ICON: Record<string, string> = { list_files:'📂', read_file:'📄', stage_patch:'✏️', apply_patch:'✅', run_command:'▶️' };
+const TOOL_LABEL: Record<string, string> = { list_files:'列出文件', read_file:'读取文件', stage_patch:'生成补丁', apply_patch:'写入补丁', run_command:'执行命令' };
 
 function suggestionFromStream(raw: string): string {
   const marker = '"suggestion":';
@@ -73,7 +73,9 @@ function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onAppr
   const preview = result.preview;
   const file = preview?.relativePath ?? result.relativePath ?? '';
   const isPatch = trace.name === 'stage_patch' && preview;
+  const isCommand = trace.name === 'run_command';
   const isAwaiting = result.status === 'awaiting_approval';
+  const isCommandAwaiting = isCommand && isAwaiting;
   const [expanded, setExpanded] = useState(false);
   return <section className="tool-card">
     <div className="tool-header" onClick={() => setExpanded(!expanded)}>
@@ -82,8 +84,14 @@ function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onAppr
       {file && <span className="tool-file">{file}</span>}
       <span className={`tool-status tool-status-${status??result.status??'completed'}`}>{status ?? result.status ?? '完成'}</span>
     </div>
-    {(expanded || isPatch) && <div className="tool-body">
-      {isPatch ? <div className="diff-columns"><div><h4>修改前</h4><pre>{preview.before}</pre></div><div><h4>修改后</h4><pre>{preview.after}</pre></div></div> : <pre className="tool-result">{typeof result === 'string' ? result : JSON.stringify(result, null, 2)}</pre>}
+    {(expanded || isPatch || isCommandAwaiting) && <div className="tool-body">
+      {isPatch ? <div className="diff-columns"><div><h4>修改前</h4><pre>{preview.before}</pre></div><div><h4>修改后</h4><pre>{preview.after}</pre></div></div> : isCommand ? <div className="command-block">
+        <pre className="tool-result command-line"><span className="command-prompt">$</span> {result.command}</pre>
+        {result.cwd ? <p className="command-meta">目录：{result.cwd}</p> : null}
+        {isCommandAwaiting && result.reason ? <p className="command-reason">{result.reason}</p> : null}
+        {!isCommandAwaiting && <>{result.stdout ? <pre className="tool-result command-output">{result.stdout}</pre> : null}{result.stderr ? <pre className="tool-result command-output command-error">{result.stderr}</pre> : null}{result.truncated ? <p className="command-meta">输出超过 256KB，已截断</p> : null}<p className="command-meta">退出码 {result.exitCode ?? '?'}{result.durationMs != null ? ` · 耗时 ${result.durationMs}ms` : ''}</p></>}
+        {isCommandAwaiting && !status && <div className="diff-actions"><button onClick={onApprove}>允许执行</button><button className="secondary" onClick={onReject}>拒绝</button></div>}
+      </div> : <pre className="tool-result">{typeof result === 'string' ? result : JSON.stringify(result, null, 2)}</pre>}
       {isPatch && !status && isAwaiting && <div className="diff-actions"><button onClick={onApprove}>确认写入</button><button className="secondary" onClick={onReject}>拒绝</button></div>}
       {status && <p className="task-status">状态：{status}</p>}
     </div>}
@@ -99,7 +107,7 @@ function App() {
   useEffect(() => { api<{ user: User | null }>('/api/auth/me').then(result => { setUser(result.user); if (result.user) loadConversations(); }); }, []);
   useEffect(() => { const load = () => api<{ devices: Device[] }>('/api/agents').then(result => { setDevices(result.devices); setAgentContext(current => current ?? (result.devices[0]?.roots[0] ? { deviceId: result.devices[0].id, rootId: result.devices[0].roots[0].id } : null)); }).catch(() => undefined); load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
   if (!user) return <Login onLogin={next => { setUser(next); loadConversations(); }} />;
-  const poll = (taskId: string) => { const timer = setInterval(async () => { try { const detail = await api<{ task: { status: string } }>(`/api/agent-tasks/${taskId}`); if (['completed', 'failed', 'rejected', 'expired'].includes(detail.task.status)) { clearInterval(timer); setApprovalStatus(current => ({ ...current, [taskId]: detail.task.status })); } } catch { clearInterval(timer); } }, 1000); };
+  const poll = (taskId: string) => { const timer = setInterval(async () => { try { const detail = await api<{ task: { status: string; kind: string }; events: Array<{ status: string; detail?: any }> }>(`/api/agent-tasks/${taskId}`); if (['completed', 'failed', 'rejected', 'expired'].includes(detail.task.status)) { clearInterval(timer); setApprovalStatus(current => ({ ...current, [taskId]: detail.task.status })); if (detail.task.kind === 'run_command' && detail.task.status === 'completed') { const finalEvent = detail.events.find(event => event.status === 'completed'); const result = finalEvent?.detail?.result; if (result) setTraces(current => current.map(trace => String(trace.result?.taskId ?? '') === taskId ? { ...trace, result: { ...trace.result, ...result, taskId } } : trace)); } } } catch { clearInterval(timer); } }, 1000); };
   const approve = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '写入中' })); try { await api(`/api/agent-tasks/${taskId}/approve`, { method: 'POST' }); poll(taskId); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
   const reject = async (taskId: string) => { setApprovalStatus(current => ({ ...current, [taskId]: '拒绝中' })); try { await api(`/api/agent-tasks/${taskId}/reject`, { method: 'POST' }); setApprovalStatus(current => ({ ...current, [taskId]: '已拒绝' })); } catch (e) { setApprovalStatus(current => ({ ...current, [taskId]: (e as Error).message })); } };
 
@@ -167,7 +175,7 @@ function App() {
   const unbound = conversations.filter(c => !c.rootId || !projects.some(p => p.root.id === c.rootId));
   const activeStreaming = active ? streaming[active.id] : undefined;
   const renderedMessages = activeStreaming && !messages.some(m => m.id === activeStreaming.id) ? [...messages, { id: activeStreaming.id, role: 'assistant', content: activeStreaming.content }] : messages;
-  const pending = traces.filter(trace => trace.name === 'stage_patch' && trace.result?.status === 'awaiting_approval' && !approvalStatus[String(trace.result.taskId)]);
+  const pending = traces.filter(trace => (trace.name === 'stage_patch' || trace.name === 'run_command') && trace.result?.status === 'awaiting_approval' && !approvalStatus[String(trace.result.taskId)]);
   return (
     <div className="shell">
       <aside>
@@ -202,7 +210,7 @@ function App() {
           {renderedMessages.map(message => <article key={message.id} className={message.role}><div className="avatar">{message.role === 'user' ? '我' : 'AI'}</div><div className="bubble"><div className="msg-name">{message.role === 'user' ? '你' : 'AI 助手'}</div><div className="msg-text">{message.content}</div></div></article>)}
           {traces.map((trace, index) => <ToolCard key={`${trace.name}-${index}`} trace={trace} status={trace.result?.taskId ? approvalStatus[String(trace.result.taskId)] : undefined} onApprove={() => approve(String(trace.result.taskId))} onReject={() => reject(String(trace.result.taskId))} />)}
         </section>
-        {pending.length > 0 && <div className="approval-list"><p>以下补丁等待你的确认，确认后才会写入本地工程。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>确认写入补丁</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}
+        {pending.length > 0 && <div className="approval-list"><p>以下操作等待你的确认，确认后才会在本地工程执行。</p>{pending.map(trace => <span key={trace.result.taskId}><button onClick={() => approve(String(trace.result.taskId))}>{trace.name === 'run_command' ? '允许执行命令' : '确认写入补丁'}</button><small>任务 {String(trace.result.taskId).slice(0, 8)}</small></span>)}</div>}
         {renderedMessages.length > 0 && <footer>
           <textarea value={requirement} onChange={event => setRequirement(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} placeholder="输入你的问题，或描述想让 AI 处理的工程任务…" />
           <div className="sendrow">{error && <span className="error">{error}</span>}<span className="busy-hint">{busy ? 'AI 工作中…' : ''}</span><button className="send-btn" disabled={busy || !requirement.trim()} onClick={() => send()} title={busy ? '处理中' : '发送'}>{busy ? <span className="spinner" /> : '↑'}</button></div>

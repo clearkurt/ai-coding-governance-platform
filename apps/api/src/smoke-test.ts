@@ -75,6 +75,35 @@ if (applyMsg.type !== 'task' || applyMsg.payload.kind !== 'apply_patch') throw n
 if (!applyMsg.payload.approvalToken || !applyMsg.payload.approvalTokenHash || applyMsg.payload.approvalTokenHash.length !== 64) throw new Error('apply_patch 任务缺少审批令牌');
 ws.send(JSON.stringify({ version:1, messageId:'smoke-apply-result', type:'task_result', deviceId, taskId: applyMsg.taskId, payload:{ status:'completed', result:{ relativePath:'src/main.c', sha256:'x' } } }));
 
+// run_command 审批链路：awaiting_approval → approve → 携带令牌重新派发 → completed
+const cmdTask = await app.inject({ method:'POST', url:`/api/agents/${deviceId}/tasks`, headers:{ cookie }, payload:{ rootId, kind:'run_command', payload:{ command:'git status', cwd:'' } } });
+if (cmdTask.statusCode !== 200) throw new Error(`run_command 创建失败：${cmdTask.body}`);
+const cmdMsg = await wsMessage();
+if (cmdMsg.type !== 'task' || cmdMsg.taskId !== cmdTask.json().taskId || cmdMsg.payload.kind !== 'run_command') throw new Error('run_command 未通过 WS 下发');
+ws.send(JSON.stringify({ version:1, messageId:'smoke-cmd-awaiting', type:'task_result', deviceId, taskId: cmdMsg.taskId, payload:{ status:'awaiting_approval', result:{ status:'awaiting_approval', command:'git status', cwd:'', reason:'需要批准' } } }));
+await new Promise<any>((resolve, reject) => { const timer = setInterval(async () => { try { const detail = await app.inject({ method:'GET', url:`/api/agent-tasks/${cmdMsg.taskId}`, headers:{ cookie } }); const status = detail.json().task?.status; if (status === 'awaiting_approval') { clearInterval(timer); resolve(detail.json().task); } else if (['completed','failed','expired','rejected'].includes(status)) { clearInterval(timer); reject(new Error(`命令任务异常：${status}`)); } } catch { /* retry */ } }, 50); setTimeout(() => { clearInterval(timer); reject(new Error('命令任务未进入等待审批状态')); }, 5000); });
+const cmdApprove = await app.inject({ method:'POST', url:`/api/agent-tasks/${cmdMsg.taskId}/approve`, headers:{ cookie } });
+if (cmdApprove.statusCode !== 200) throw new Error(`命令审批失败：${cmdApprove.body}`);
+const cmdExecMsg = await wsMessage();
+if (cmdExecMsg.type !== 'task' || cmdExecMsg.payload.kind !== 'run_command') throw new Error('审批后未下发 run_command 任务');
+if (!cmdExecMsg.payload.approvalToken || !cmdExecMsg.payload.approvalTokenHash || cmdExecMsg.payload.approvalTokenHash.length !== 64) throw new Error('run_command 任务缺少审批令牌');
+if (cmdExecMsg.payload.command !== 'git status') throw new Error('run_command 命令被篡改');
+ws.send(JSON.stringify({ version:1, messageId:'smoke-cmd-result', type:'task_result', deviceId, taskId: cmdExecMsg.taskId, payload:{ status:'completed', result:{ status:'completed', command:'git status', cwd:'', exitCode:0, stdout:'', stderr:'', durationMs:5 } } }));
+const cmdDone = await new Promise<any>((resolve, reject) => { const timer = setInterval(async () => { try { const detail = await app.inject({ method:'GET', url:`/api/agent-tasks/${cmdExecMsg.taskId}`, headers:{ cookie } }); const status = detail.json().task?.status; if (['completed','failed','rejected','expired'].includes(status)) { clearInterval(timer); resolve(detail.json().task); } } catch { /* retry */ } }, 50); setTimeout(() => { clearInterval(timer); reject(new Error('run_command 完成状态超时')); }, 5000); });
+if (cmdDone.status !== 'completed') throw new Error(`run_command 未完成：${JSON.stringify(cmdDone)}`);
+
+// run_command 拒绝链路
+const denyTask = await app.inject({ method:'POST', url:`/api/agents/${deviceId}/tasks`, headers:{ cookie }, payload:{ rootId, kind:'run_command', payload:{ command:'npm test', cwd:'' } } });
+if (denyTask.statusCode !== 200) throw new Error(`run_command 拒绝链路创建失败：${denyTask.body}`);
+const denyMsg = await wsMessage();
+if (denyMsg.type !== 'task' || denyMsg.taskId !== denyTask.json().taskId) throw new Error('run_command 拒绝链路未通过 WS 下发');
+ws.send(JSON.stringify({ version:1, messageId:'smoke-cmd-deny', type:'task_result', deviceId, taskId: denyMsg.taskId, payload:{ status:'awaiting_approval', result:{ status:'awaiting_approval', command:'npm test', cwd:'', reason:'需要批准' } } }));
+await new Promise<void>((resolve, reject) => { const timer = setInterval(async () => { try { const detail = await app.inject({ method:'GET', url:`/api/agent-tasks/${denyMsg.taskId}`, headers:{ cookie } }); if (detail.json().task?.status === 'awaiting_approval') { clearInterval(timer); resolve(); } } catch { /* retry */ } }, 50); setTimeout(() => { clearInterval(timer); reject(new Error('拒绝前状态超时')); }, 5000); });
+const denyResult = await app.inject({ method:'POST', url:`/api/agent-tasks/${denyMsg.taskId}/reject`, headers:{ cookie } });
+if (denyResult.statusCode !== 200) throw new Error(`命令拒绝失败：${denyResult.body}`);
+const denyDetail = await app.inject({ method:'GET', url:`/api/agent-tasks/${denyMsg.taskId}`, headers:{ cookie } });
+if (denyDetail.json().task?.status !== 'rejected') throw new Error(`run_command 未按预期拒绝：${denyDetail.body}`);
+
 ws.close();
 
 // 会话绑定项目：按项目创建、列表返回 rootId、禁止中途切换

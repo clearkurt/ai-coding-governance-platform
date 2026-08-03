@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 export interface Generation { analysis: string; suggestion: string; code: string; cautions: string[]; }
 export interface ModelInput { requirement: string; codeStyle: string; sources: Array<{name:string;content:string}>; history?: ChatMessage[]; toolsAvailable?: boolean; projectRules?: string; }
 export interface ModelProvider { generate(input: ModelInput): Promise<Generation>; }
-export type AgentToolName = 'list_files' | 'read_file' | 'stage_patch' | 'apply_patch';
+export type AgentToolName = 'list_files' | 'read_file' | 'stage_patch' | 'apply_patch' | 'run_command';
 export interface AgentToolCall { name: AgentToolName; arguments: Record<string, unknown>; }
 export interface AgentTurn { kind: 'tool_call' | 'final'; toolCall?: AgentToolCall; generation?: Generation; }
 export interface AgentToolInput extends ModelInput { toolResults?: Array<{ call: AgentToolCall; result: unknown }>; }
@@ -14,7 +14,8 @@ const toolArgumentSchemas: Record<AgentToolName, z.ZodType<Record<string, unknow
   list_files: z.object({ relativePath: z.string().max(500).default('') }).passthrough(),
   read_file: z.object({ relativePath: z.string().min(1).max(500) }).passthrough(),
   stage_patch: z.object({ relativePath: z.string().min(1).max(500), originalSha256: z.string().regex(/^[a-f0-9]{64}$/), newContent: z.string().max(1024 * 1024) }).passthrough(),
-  apply_patch: z.object({ relativePath: z.string().min(1).max(500), originalSha256: z.string().regex(/^[a-f0-9]{64}$/), newContent: z.string().max(1024 * 1024), approvalToken: z.string().min(16).max(200) }).passthrough()
+  apply_patch: z.object({ relativePath: z.string().min(1).max(500), originalSha256: z.string().regex(/^[a-f0-9]{64}$/), newContent: z.string().max(1024 * 1024), approvalToken: z.string().min(16).max(200) }).passthrough(),
+  run_command: z.object({ command: z.string().min(1).max(2000), cwd: z.string().max(500).default('') }).passthrough()
 };
 
 export function validateAgentToolCall(call: AgentToolCall): AgentToolCall {
