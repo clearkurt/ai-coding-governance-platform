@@ -83,6 +83,14 @@ fn apply(root: &Root, payload: &Value) -> Result<Value> {
     let relative = payload["relativePath"].as_str().context("缺少相对路径")?;
     let path = safe_path(root, relative)?;
     verify_file(&path)?;
+    let token = payload["approvalToken"].as_str().context("缺少审批令牌")?;
+    let token_hash = payload["approvalTokenHash"].as_str().context("缺少审批令牌哈希")?;
+    if token.len() < 16 || token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("审批令牌无效，拒绝写入");
+    }
+    if digest(token.as_bytes()) != token_hash {
+        bail!("审批令牌校验失败，拒绝写入");
+    }
     let before = fs::read(&path)?;
     let expected = payload["originalSha256"].as_str().context("缺少原文件哈希")?;
     if digest(&before) != expected { bail!("原文件已变更，拒绝覆盖（请重新生成补丁）：{}", path.display()) }
@@ -102,4 +110,5 @@ mod tests {
     #[test] fn rejects_secret_file() { let dir=std::env::temp_dir().join(format!("agent-secret-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join(".env"); fs::write(&path,"SECRET").unwrap(); assert!(verify_file(&path).is_err()); fs::remove_dir_all(dir).unwrap(); }
     #[test] fn allows_common_source_files() { let dir=std::env::temp_dir().join(format!("agent-ext-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); for name in ["main.rs","App.tsx","index.js","script.py","style.css","data.json"] { let path=dir.join(name); fs::write(&path,"test").unwrap(); assert!(verify_file(&path).is_ok(), "应允许读取 {name}"); } fs::remove_dir_all(dir).unwrap(); }
     #[test] fn rejects_oversize_file() { let dir=std::env::temp_dir().join(format!("agent-size-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join("big.bin"); fs::write(&path,vec![0u8;(MAX_BYTES as usize)+1]).unwrap(); assert!(verify_file(&path).is_err()); fs::remove_dir_all(dir).unwrap(); }
+    #[test] fn apply_requires_valid_approval_token() { let dir=std::env::temp_dir().join(format!("agent-apply-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join("main.c"); fs::write(&path,"int a;").unwrap(); let root=Root{id:"root".into(),path:dir.clone(),label:"test".into()}; let original=digest(&fs::read(&path).unwrap()); let token="approve-token-123456"; let hash=digest(token.as_bytes()); let ok_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":original,"newContent":"int b;","approvalToken":token,"approvalTokenHash":hash}); assert!(apply(&root,&ok_payload).is_ok(), "有效令牌应允许写入"); assert_eq!(fs::read_to_string(&path).unwrap(),"int b;"); let bad_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;","approvalToken":"wrong-token","approvalTokenHash":hash}); assert!(apply(&root,&bad_payload).is_err(), "错误令牌应被拒绝"); let missing_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;"}); assert!(apply(&root,&missing_payload).is_err(), "缺少令牌应被拒绝"); fs::remove_dir_all(dir).unwrap(); }
 }

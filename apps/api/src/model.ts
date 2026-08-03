@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 
 export interface Generation { analysis: string; suggestion: string; code: string; cautions: string[]; }
-export interface ModelInput { requirement: string; codeStyle: string; sources: Array<{name:string;content:string}>; history?: ChatMessage[]; toolsAvailable?: boolean; }
+export interface ModelInput { requirement: string; codeStyle: string; sources: Array<{name:string;content:string}>; history?: ChatMessage[]; toolsAvailable?: boolean; projectRules?: string; }
 export interface ModelProvider { generate(input: ModelInput): Promise<Generation>; }
 export type AgentToolName = 'list_files' | 'read_file' | 'stage_patch' | 'apply_patch';
 export interface AgentToolCall { name: AgentToolName; arguments: Record<string, unknown>; }
@@ -87,7 +87,7 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
       body: JSON.stringify({ model: this.model, temperature: 0.2, stream: Boolean(onDelta), response_format: { type: 'json_object' }, messages: [
         { role: 'system', content: this.agentPrompt },
         ...(input.history ?? []),
-        { role: 'user', content: JSON.stringify({ requirement: input.requirement, sources: input.sources, toolResults: input.toolResults ?? [], toolsAvailable: input.toolsAvailable ?? true }) }
+        { role: 'user', content: JSON.stringify({ requirement: input.requirement, codeStyle: input.codeStyle, projectRules: input.projectRules ?? '', sources: input.sources, toolResults: input.toolResults ?? [], toolsAvailable: input.toolsAvailable ?? true }) }
       ] })
       });
     } catch (error) {

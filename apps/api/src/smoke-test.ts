@@ -44,19 +44,37 @@ if (pairResult.type !== 'pair_result') throw new Error(`WS 配对失败：${JSON
 const deviceId = pairResult.deviceId;
 const credential = pairResult.payload.credential;
 const rootId = pairResult.payload.roots[0].id;
-ws.send(JSON.stringify({ version:1, messageId:'smoke-hello', type:'hello', deviceId, payload:{ credential, version:'0.1.0' } }));
+ws.send(JSON.stringify({ version:1, messageId:'smoke-hello', type:'hello', deviceId, payload:{ credential, version:'0.1.0', rules:[{ rootId, content:'团队规则 ABC' }] } }));
 const helloResult = await wsMessage();
 if (helloResult.type !== 'hello_result') throw new Error('WS hello 失败');
+const devicesAfterHello = await app.inject({ method:'GET', url:'/api/agents', headers:{ cookie } });
+const helloRoot = devicesAfterHello.json().devices.find((d:any) => d.id === deviceId)?.roots.find((r:any) => r.id === rootId);
+if (!helloRoot || helloRoot.rules !== '团队规则 ABC') throw new Error(`hello 未保存项目规则：${JSON.stringify(helloRoot)}`);
 const selectTask = await app.inject({ method:'POST', url:`/api/agents/${deviceId}/tasks`, headers:{ cookie }, payload:{ rootId, kind:'select_root', payload:{} } });
 if (selectTask.statusCode !== 200) throw new Error(`select_root 创建失败：${selectTask.body}`);
 const taskMessage = await wsMessage();
 if (taskMessage.type !== 'task' || taskMessage.taskId !== selectTask.json().taskId) throw new Error('select_root 任务未通过 WS 下发');
-ws.send(JSON.stringify({ version:1, messageId:'smoke-result', type:'task_result', deviceId, taskId: taskMessage.taskId, payload:{ status:'completed', result:{ rootId, label:'新目录' } } }));
+ws.send(JSON.stringify({ version:1, messageId:'smoke-result', type:'task_result', deviceId, taskId: taskMessage.taskId, payload:{ status:'completed', result:{ rootId, label:'新目录', rules:'新规则 XYZ' } } }));
 const taskDone = await new Promise<any>((resolve, reject) => { const timer = setInterval(async () => { try { const detail = await app.inject({ method:'GET', url:`/api/agent-tasks/${taskMessage.taskId}`, headers:{ cookie } }); const status = detail.json().task?.status; if (['completed','failed','expired','rejected'].includes(status)) { clearInterval(timer); resolve(detail.json().task); } } catch { /* retry */ } }, 50); setTimeout(() => { clearInterval(timer); reject(new Error('select_root 任务状态超时')); }, 5000); });
 if (taskDone.status !== 'completed') throw new Error(`select_root 未完成：${JSON.stringify(taskDone)}`);
 const devicesAfter = await app.inject({ method:'GET', url:'/api/agents', headers:{ cookie } });
 const updatedRoot = devicesAfter.json().devices.find((d:any) => d.id === deviceId)?.roots.find((r:any) => r.id === rootId);
-if (!updatedRoot || updatedRoot.label !== '新目录') throw new Error(`select_root 标签未更新：${JSON.stringify(updatedRoot)}`);
+if (!updatedRoot || updatedRoot.label !== '新目录' || updatedRoot.rules !== '新规则 XYZ') throw new Error(`select_root 标签/规则未更新：${JSON.stringify(updatedRoot)}`);
+
+// 补丁审批令牌链路：stage_patch → awaiting_approval → approve → apply_patch 携带令牌
+const stageTask = await app.inject({ method:'POST', url:`/api/agents/${deviceId}/tasks`, headers:{ cookie }, payload:{ rootId, kind:'stage_patch', payload:{ relativePath:'src/main.c', originalSha256:'a'.repeat(64), newContent:'int main(void) { return 0; }' } } });
+if (stageTask.statusCode !== 200) throw new Error(`stage_patch 创建失败：${stageTask.body}`);
+const stageMsg = await wsMessage();
+if (stageMsg.type !== 'task' || stageMsg.taskId !== stageTask.json().taskId) throw new Error('stage_patch 未通过 WS 下发');
+ws.send(JSON.stringify({ version:1, messageId:'smoke-stage-result', type:'task_result', deviceId, taskId: stageMsg.taskId, payload:{ status:'awaiting_approval', result:{ status:'awaiting_approval', relativePath:'src/main.c', originalSha256:'a'.repeat(64), preview:{ before:'x', after:'y' } } } }));
+await new Promise<any>((resolve, reject) => { const timer = setInterval(async () => { try { const detail = await app.inject({ method:'GET', url:`/api/agent-tasks/${stageMsg.taskId}`, headers:{ cookie } }); const status = detail.json().task?.status; if (status === 'awaiting_approval') { clearInterval(timer); resolve(detail.json().task); } else if (['completed','failed','expired','rejected'].includes(status)) { clearInterval(timer); reject(new Error(`stage 任务异常：${status}`)); } } catch { /* retry */ } }, 50); setTimeout(() => { clearInterval(timer); reject(new Error('stage 任务未进入等待审批状态')); }, 5000); });
+const approveResult = await app.inject({ method:'POST', url:`/api/agent-tasks/${stageMsg.taskId}/approve`, headers:{ cookie } });
+if (approveResult.statusCode !== 200) throw new Error(`审批失败：${approveResult.body}`);
+const applyMsg = await wsMessage();
+if (applyMsg.type !== 'task' || applyMsg.payload.kind !== 'apply_patch') throw new Error('审批后未下发 apply_patch 任务');
+if (!applyMsg.payload.approvalToken || !applyMsg.payload.approvalTokenHash || applyMsg.payload.approvalTokenHash.length !== 64) throw new Error('apply_patch 任务缺少审批令牌');
+ws.send(JSON.stringify({ version:1, messageId:'smoke-apply-result', type:'task_result', deviceId, taskId: applyMsg.taskId, payload:{ status:'completed', result:{ relativePath:'src/main.c', sha256:'x' } } }));
+
 ws.close();
 
 // 会话绑定项目：按项目创建、列表返回 rootId、禁止中途切换

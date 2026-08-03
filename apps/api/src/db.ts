@@ -24,6 +24,10 @@ const conversationColumns = db.prepare('PRAGMA table_info(conversations)').all()
 if (!conversationColumns.some(column => column.name === 'root_id')) {
   db.exec('ALTER TABLE conversations ADD COLUMN root_id TEXT');
 }
+const rootColumns = db.prepare('PRAGMA table_info(device_roots)').all() as Array<{ name: string }>;
+if (!rootColumns.some(column => column.name === 'rules')) {
+  db.exec('ALTER TABLE device_roots ADD COLUMN rules TEXT');
+}
 
 export const id = () => crypto.randomUUID();
 export const now = () => new Date().toISOString();
