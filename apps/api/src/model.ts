@@ -15,7 +15,7 @@ const toolArgumentSchemas: Record<AgentToolName, z.ZodType<Record<string, unknow
   read_file: z.object({ relativePath: z.string().min(1).max(500) }).passthrough(),
   stage_patch: z.object({ relativePath: z.string().min(1).max(500), originalSha256: z.string().regex(/^[a-f0-9]{64}$/), newContent: z.string().max(1024 * 1024) }).passthrough(),
   apply_patch: z.object({ relativePath: z.string().min(1).max(500), originalSha256: z.string().regex(/^[a-f0-9]{64}$/), newContent: z.string().max(1024 * 1024), approvalToken: z.string().min(16).max(200) }).passthrough(),
-  run_command: z.object({ command: z.string().min(1).max(2000), cwd: z.string().max(500).default('') }).passthrough()
+  run_command: z.object({ command: z.string().min(1).max(2000), cwd: z.string().max(500).default(''), timeoutSeconds: z.number().int().min(1).max(600).optional() }).passthrough()
 };
 
 export function validateAgentToolCall(call: AgentToolCall): AgentToolCall {

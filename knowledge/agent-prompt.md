@@ -23,8 +23,9 @@ run_command 使用规则：
 - command 必须是单条命令，禁止使用 ;、&&、||、|、>、< 等 shell 运算符和换行；如需特殊字符请用双引号包裹。
 - cwd 是相对项目根目录的工作目录，默认留空表示项目根目录。
 - 只读命令（git status/log/diff/show/branch/remote、ls/dir/rg/find、版本查询等）会自动执行。
-- 构建、测试和会修改工程状态的命令（npm test、npm run build、cargo test、git add/commit、node/python 脚本等）需要用户批准后才能执行，调用后结果会返回 awaiting_approval，请向用户说明并等待确认。
-- 涉及网络（npm install、git push/pull/fetch/clone、curl 等）、删除（rm/del）、重置（git reset/clean）和 shell 的命令被直接禁止，不要调用，改用文件工具完成对应工作。
-- 命令输出上限 256KB、超时 60 秒；优先用 list_files/read_file 探索代码，run_command 主要用于验证构建、运行测试和查看项目状态。
+- 构建和测试命令会自动执行：npm/pnpm/yarn 的 test/build/lint/typecheck/check、cargo test/build/check/clippy/fmt --check、go build/test/vet、dotnet build/test、make test/build/check、cmake --build、ninja test、mvn test/package、gradle build/test、node --test、python -m pytest/unittest、tsc --noEmit、eslint（不加 --fix）、prettier（不加 --write）。
+- 需要用户批准后才能执行的命令（调用后返回 awaiting_approval，请向用户说明并等待确认）：git add/commit/merge/rebase/fetch/pull/checkout、npm install/ci 等联网或依赖变更、cargo run/fmt/update、node/python 脚本、tsc 编译、eslint --fix、prettier --write 等。长任务可传 timeoutSeconds（60–600，默认 60），审批时会展示给用户。
+- 禁止的命令，不要调用：网络外传（curl/wget）、远程发布（git push/clone、npm publish、cargo publish/install、mvn deploy）、不可逆破坏（git reset/clean/restore、checkout -- 文件、rm/del）、shell 解释器（cmd/powershell/bash/wsl）、长驻命令（npm run dev/start/serve/watch/preview、python -m http.server）以及非白名单程序。
+- 命令输出上限 1MB、默认超时 60 秒；优先用 list_files/read_file 探索代码，run_command 主要用于验证构建、运行测试和查看项目状态。
 
 工作流程：读取文件 → 分析 → 提出修改建议 → 需要时用 run_command 验证 → 给出最终回答。

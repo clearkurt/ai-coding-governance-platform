@@ -77,6 +77,7 @@ function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onAppr
   const isAwaiting = result.status === 'awaiting_approval';
   const isCommandAwaiting = isCommand && isAwaiting;
   const [expanded, setExpanded] = useState(false);
+  const [showFullOutput, setShowFullOutput] = useState(false);
   return <section className="tool-card">
     <div className="tool-header" onClick={() => setExpanded(!expanded)}>
       <span className="tool-icon">{TOOL_ICON[trace.name] ?? '🔧'}</span>
@@ -88,8 +89,9 @@ function ToolCard({ trace, onApprove, onReject, status }: { trace: Trace; onAppr
       {isPatch ? <div className="diff-columns"><div><h4>修改前</h4><pre>{preview.before}</pre></div><div><h4>修改后</h4><pre>{preview.after}</pre></div></div> : isCommand ? <div className="command-block">
         <pre className="tool-result command-line"><span className="command-prompt">$</span> {result.command}</pre>
         {result.cwd ? <p className="command-meta">目录：{result.cwd}</p> : null}
+        <p className="command-meta">超时：{result.timeoutSeconds ?? 60} 秒</p>
         {isCommandAwaiting && result.reason ? <p className="command-reason">{result.reason}</p> : null}
-        {!isCommandAwaiting && <>{result.stdout ? <pre className="tool-result command-output">{result.stdout}</pre> : null}{result.stderr ? <pre className="tool-result command-output command-error">{result.stderr}</pre> : null}{result.truncated ? <p className="command-meta">输出超过 256KB，已截断</p> : null}<p className="command-meta">退出码 {result.exitCode ?? '?'}{result.durationMs != null ? ` · 耗时 ${result.durationMs}ms` : ''}</p></>}
+        {!isCommandAwaiting && <>{result.stdout ? <pre className={showFullOutput ? 'tool-result command-output command-output-full' : 'tool-result command-output'}>{result.stdout}</pre> : null}{result.stderr ? <pre className={showFullOutput ? 'tool-result command-output command-error command-output-full' : 'tool-result command-output command-error'}>{result.stderr}</pre> : null}{result.truncated ? <div className="command-actions"><button className="secondary" onClick={() => setShowFullOutput(!showFullOutput)}>{showFullOutput ? '收起完整输出' : '查看完整输出'}</button><span className="command-meta">输出超过 1MB，已截断</span></div> : null}<p className="command-meta">退出码 {result.exitCode ?? '?'}{result.durationMs != null ? ` · 耗时 ${result.durationMs}ms` : ''}</p></>}
         {isCommandAwaiting && !status && <div className="diff-actions"><button onClick={onApprove}>允许执行</button><button className="secondary" onClick={onReject}>拒绝</button></div>}
       </div> : <pre className="tool-result">{typeof result === 'string' ? result : JSON.stringify(result, null, 2)}</pre>}
       {isPatch && !status && isAwaiting && <div className="diff-actions"><button onClick={onApprove}>确认写入</button><button className="secondary" onClick={onReject}>拒绝</button></div>}
