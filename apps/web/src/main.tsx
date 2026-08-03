@@ -4,7 +4,7 @@ import './styles.css';
 
 type User = { id: string; username: string };
 type Conversation = { id: string; title: string; rootId?: string | null };
-type Message = { id: string; role: string; content: string };
+type Message = { id: string; role: string; content: string; metadata?: string };
 type Root = { id: string; label: string };
 type Device = { id: string; name: string; status: string; version: string; roots: Root[] };
 type AgentContext = { deviceId: string; rootId: string };
@@ -95,7 +95,7 @@ function App() {
   const activeIdRef = useRef<string | null>(null); activeIdRef.current = active?.id ?? null;
   const loadConversations = async () => { const result = await api<{ conversations: Conversation[] }>('/api/conversations'); setConversations(result.conversations); };
   const del = async (conversation: Conversation) => { if (!confirm(`删除对话“${conversation.title}”？此操作不可恢复。`)) return; try { await api(`/api/conversations/${conversation.id}`, { method: 'DELETE' }); if (active?.id === conversation.id) { setActive(null); setMessages([]); setTraces([]); } loadConversations(); } catch (e) { setError((e as Error).message); } };
-  const open = async (conversation: Conversation) => { const result = await api<{ conversation: { rootId?: string | null }; messages: Message[] }>(`/api/conversations/${conversation.id}`); const rootId = result.conversation.rootId ?? null; setActive({ ...conversation, rootId }); setMessages(result.messages); setTraces([]); if (rootId) { for (const device of devices) { const root = device.roots.find(r => r.id === rootId); if (root) { setAgentContext({ deviceId: device.id, rootId }); break; } } } };
+  const open = async (conversation: Conversation) => { const result = await api<{ conversation: { rootId?: string | null }; messages: Message[] }>(`/api/conversations/${conversation.id}`); const rootId = result.conversation.rootId ?? null; const restoredTraces: Trace[] = []; const restoredMessages = result.messages.map(message => { try { const metadata = message.metadata ? JSON.parse(message.metadata) : null; if (Array.isArray(metadata?.toolTrace)) restoredTraces.push(...metadata.toolTrace); } catch { /* 忽略损坏的 metadata */ } return message; }); setActive({ ...conversation, rootId }); setMessages(restoredMessages); setTraces(restoredTraces); for (const trace of restoredTraces) { const taskId = trace.result?.taskId; if (!taskId) continue; api<{ task: { status: string } }>(`/api/agent-tasks/${taskId}`).then(detail => { if (['completed','failed','rejected','expired'].includes(detail.task.status)) setApprovalStatus(current => ({ ...current, [String(taskId)]: detail.task.status })); }).catch(() => undefined); } if (rootId) { for (const device of devices) { const root = device.roots.find(r => r.id === rootId); if (root) { setAgentContext({ deviceId: device.id, rootId }); break; } } } };
   useEffect(() => { api<{ user: User | null }>('/api/auth/me').then(result => { setUser(result.user); if (result.user) loadConversations(); }); }, []);
   useEffect(() => { const load = () => api<{ devices: Device[] }>('/api/agents').then(result => { setDevices(result.devices); setAgentContext(current => current ?? (result.devices[0]?.roots[0] ? { deviceId: result.devices[0].id, rootId: result.devices[0].roots[0].id } : null)); }).catch(() => undefined); load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, []);
   if (!user) return <Login onLogin={next => { setUser(next); loadConversations(); }} />;
