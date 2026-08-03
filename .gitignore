@@ -6,4 +6,5 @@ uploads/
 .env
 *.tsbuildinfo
 apps/agent/target/
+apps/agent/*.log
 runtime-check/

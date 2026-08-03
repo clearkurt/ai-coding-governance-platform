@@ -12,9 +12,13 @@ type Trace = { name: string; result?: any };
 
 const api = async <T,>(url: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(url, { credentials: 'include', ...options, headers: { ...(options?.body instanceof FormData || options?.body === undefined ? {} : { 'Content-Type': 'application/json' }), ...options?.headers } });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error ?? '请求失败');
-  return data;
+  let data: Record<string, unknown> | null = null;
+  try { data = await response.json(); } catch { /* 响应体不是 JSON（如服务未启动返回空响应） */ }
+  if (!response.ok) {
+    const serverError = data && typeof data.error === 'string' ? data.error : undefined;
+    throw new Error(serverError ?? (data === null ? `服务暂不可用（HTTP ${response.status}），请稍后重试` : `请求失败（HTTP ${response.status}）`));
+  }
+  return data as T;
 };
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
@@ -115,7 +119,11 @@ function App() {
       setStreaming(cur => ({ ...cur, [conversation.id]: { id: assistantId, content: '思考中…' } }));
       setMessages(existing => [...existing, { id: assistantId, role: 'assistant', content: '思考中…' }]);
       const response = await fetch('/api/chat/stream', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversationId: conversation.id, content: prompt, deviceId: agentContext?.deviceId, rootId: agentContext?.rootId, sources: [] }) });
-      if (!response.ok || !response.body) throw new Error((await response.json()).error ?? '请求失败');
+      if (!response.ok || !response.body) {
+        let message = '';
+        try { const body = await response.json(); message = body?.error ?? ''; } catch { /* 非 JSON 响应 */ }
+        throw new Error(message || `服务暂不可用（HTTP ${response.status}），请稍后重试`);
+      }
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let resultTraces: Trace[] = []; let raw = '';
       const consume = (block: string) => {
         const lines = block.split(/\r?\n/); const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim(); const dataLine = lines.find(line => line.startsWith('data:'))?.slice(5).trim(); if (!dataLine) return;
