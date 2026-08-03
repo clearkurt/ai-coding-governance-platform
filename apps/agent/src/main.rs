@@ -51,16 +51,8 @@ fn read_project_rules(root: &Root) -> String {
 
 #[cfg(windows)]
 fn bring_picker_to_front() {
-    use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
-    unsafe {
-        let hwnd = GetConsoleWindow();
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_RESTORE);
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-        }
-    }
+    // 仅靠 pump_foreground 置顶文件对话框；绝不显示/操作控制台窗口，
+    // 否则会弹出 company-agent.exe 窗口，关闭它会直接终止 Agent 进程。
 }
 
 #[cfg(not(windows))]
@@ -68,13 +60,14 @@ fn bring_picker_to_front() {}
 
 #[cfg(windows)]
 fn pump_foreground() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE};
     unsafe extern "system" fn find_dialog(hwnd: *mut core::ffi::c_void, lparam: isize) -> i32 {
         unsafe {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid != lparam as u32 || IsWindowVisible(hwnd) == 0 { return 1; }
+            if pid != lparam as u32 || IsWindowVisible(hwnd) == 0 || hwnd == GetConsoleWindow() { return 1; }
             ShowWindow(hwnd, SW_RESTORE);
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
             let foreground = GetForegroundWindow();
@@ -98,12 +91,13 @@ fn pump_foreground() {}
 
 #[cfg(windows)]
 fn restore_notopmost() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, SetWindowPos, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE};
     unsafe extern "system" fn clear_topmost(hwnd: *mut core::ffi::c_void, lparam: isize) -> i32 {
         unsafe {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid == lparam as u32 {
+            if pid == lparam as u32 && hwnd != GetConsoleWindow() {
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             }
         }
@@ -116,6 +110,19 @@ fn restore_notopmost() {
 
 #[cfg(not(windows))]
 fn restore_notopmost() {}
+
+#[cfg(windows)]
+fn guard_console_close() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn ignore(_: u32) -> i32 { 1 }
+    unsafe {
+        // 忽略控制台关闭事件，防止误关 Agent 窗口导致进程退出。
+        SetConsoleCtrlHandler(Some(ignore), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn guard_console_close() {}
 
 #[cfg(windows)]
 async fn pick_folder_foreground(title: &str) -> Result<PathBuf> {
@@ -140,7 +147,7 @@ async fn pick_folder_foreground(title: &str) -> Result<PathBuf> {
 }
 fn status() -> Result<()> { let (config,_)=load_config()?; println!("设备：{}\n服务器：{}\n根目录：{}",config.device_id,config.server,config.roots.iter().map(|r|r.path.display().to_string()).collect::<Vec<_>>().join(", ")); Ok(()) }
 #[tokio::main]
-async fn main() -> Result<()> { let cli=Cli::parse(); match cli.command { Command::Enroll{server,code,name}=>enroll(server,code,name).await, Command::Run=>run().await, Command::Status=>status() } }
+async fn main() -> Result<()> { guard_console_close(); let cli=Cli::parse(); match cli.command { Command::Enroll{server,code,name}=>enroll(server,code,name).await, Command::Run=>run().await, Command::Status=>status() } }
 
 #[cfg(test)]
 mod tests {
