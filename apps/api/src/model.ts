@@ -77,36 +77,73 @@ export class OpenAICompatibleProvider implements AgentModelProvider {
   }
 
   async plan(input: AgentToolInput, onDelta?: (delta: string) => void): Promise<AgentTurn> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 90_000);
-    let response: Response;
-    try {
-      response = await fetch(`${this.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
-      signal: controller.signal,
-      body: JSON.stringify({ model: this.model, temperature: 0.2, stream: Boolean(onDelta), response_format: { type: 'json_object' }, messages: [
-        { role: 'system', content: this.agentPrompt },
-        ...(input.history ?? []),
-        { role: 'user', content: JSON.stringify({ requirement: input.requirement, codeStyle: input.codeStyle, projectRules: input.projectRules ?? '', sources: input.sources, toolResults: input.toolResults ?? [], toolsAvailable: input.toolsAvailable ?? true }) }
-      ] })
-      });
-    } catch (error) {
-      throw new Error(error instanceof Error && error.name === 'AbortError' ? '模型请求超时' : `模型网关连接失败: ${error instanceof Error ? error.message : 'unknown'}`);
-    } finally { clearTimeout(timeout); }
-    if (!response.ok) { let detail = ''; try { detail = ': ' + (await response.text()).slice(0, 500); } catch { /* ignore */ } throw new Error(`模型网关请求失败：HTTP ${response.status}${detail}`); }
+    const messages: ChatMessage[] = [
+      { role: 'system', content: this.agentPrompt },
+      ...(input.history ?? []),
+      { role: 'user', content: JSON.stringify({ requirement: input.requirement, codeStyle: input.codeStyle, projectRules: input.projectRules ?? '', sources: input.sources, toolResults: input.toolResults ?? [], toolsAvailable: input.toolsAvailable ?? true }) }
+    ];
     let content = '';
-    if (onDelta && response.body) {
-      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-      while (true) { const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true }); const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? ''; for (const line of lines) { if (!line.startsWith('data:')) continue; const value = line.slice(5).trim(); if (!value || value === '[DONE]') continue; try { const delta = (JSON.parse(value) as { choices?: Array<{ delta?: { content?: string } }> }).choices?.[0]?.delta?.content ?? ''; if (delta) { content += delta; onDelta(delta); } } catch { /* ignore incomplete gateway chunks */ } } }
-    } else { const body = await response.json() as ChatResponse; content = body.choices?.[0]?.message?.content ?? ''; }
-    if (!content) throw new Error('模型网关未返回内容');
+    let reasoningLength = 0;
+    if (onDelta) {
+      content = await this.streamPlanOnce(messages, onDelta, length => { reasoningLength = length; });
+    }
+    if (!content) {
+      // 网关偶发只返回 reasoning_content 而 content 为空，自动改用非流式重试一次。
+      content = await this.completePlanOnce(messages);
+      if (content && onDelta) onDelta(content);
+    }
+    if (!content) throw new Error(`模型网关未返回内容（reasoning ${reasoningLength} 字符，HTTP 200）；请稍后重试`);
     let parsed: Partial<AgentTurn>;
     try { parsed = JSON.parse(content) as Partial<AgentTurn>; } catch { throw new Error(`模型返回了非 JSON 内容：${content.slice(0, 500)}`); }
     if (parsed.kind === 'tool_call' && parsed.toolCall) return { kind: 'tool_call', toolCall: validateAgentToolCall(parsed.toolCall as AgentToolCall) };
     const generation = parsed.generation as Partial<Generation> | undefined;
     if (parsed.kind !== 'final' || !generation || typeof generation.analysis !== 'string' || typeof generation.suggestion !== 'string' || typeof generation.code !== 'string' || !Array.isArray(generation.cautions)) throw new Error(`模型返回格式无效，收到：${JSON.stringify(parsed).slice(0, 500)}`);
     return { kind: 'final', generation: { analysis: generation.analysis, suggestion: generation.suggestion, code: generation.code, cautions: generation.cautions.filter((x): x is string => typeof x === 'string') } };
+  }
+
+  private async streamPlanOnce(messages: ChatMessage[], onDelta: (delta: string) => void, onReasoning: (length: number) => void): Promise<string> {
+    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 90_000); let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl.replace(/\/$/, '')}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` }, signal: controller.signal, body: JSON.stringify({ model: this.model, temperature: 0.2, stream: true, response_format: { type: 'json_object' }, messages }) });
+    } catch (error) {
+      throw new Error(error instanceof Error && error.name === 'AbortError' ? '模型请求超时' : `模型网关连接失败: ${error instanceof Error ? error.message : 'unknown'}`);
+    } finally { clearTimeout(timeout); }
+    if (!response.ok) { let detail = ''; try { detail = ': ' + (await response.text()).slice(0, 500); } catch { /* ignore */ } throw new Error(`模型网关请求失败：HTTP ${response.status}${detail}`); }
+    let content = '';
+    let reasoning = 0;
+    if (response.body) {
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+      while (true) {
+        const chunk = await reader.read(); if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const value = line.slice(5).trim();
+          if (!value || value === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(value) as { choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }> };
+            const delta = parsed.choices?.[0]?.delta ?? {};
+            if (typeof delta.content === 'string' && delta.content) { content += delta.content; onDelta(delta.content); }
+            if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content.length;
+          } catch { /* ignore incomplete gateway chunks */ }
+        }
+      }
+    }
+    onReasoning(reasoning);
+    return content;
+  }
+
+  private async completePlanOnce(messages: ChatMessage[]): Promise<string> {
+    const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 90_000); let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl.replace(/\/$/, '')}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` }, signal: controller.signal, body: JSON.stringify({ model: this.model, temperature: 0.2, stream: false, response_format: { type: 'json_object' }, messages }) });
+    } catch (error) {
+      throw new Error(error instanceof Error && error.name === 'AbortError' ? '模型请求超时' : `模型网关连接失败: ${error instanceof Error ? error.message : 'unknown'}`);
+    } finally { clearTimeout(timeout); }
+    if (!response.ok) { let detail = ''; try { detail = ': ' + (await response.text()).slice(0, 500); } catch { /* ignore */ } throw new Error(`模型网关请求失败：HTTP ${response.status}${detail}`); }
+    const body = await response.json() as ChatResponse;
+    return body.choices?.[0]?.message?.content ?? '';
   }
 }
 import { z } from 'zod';
