@@ -18,9 +18,9 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.schema import has_target_schema
 from app.db.session import SessionLocal, engine, get_session
 from app.dependencies import SESSION_COOKIE, current_user, get_store, new_session_token, session_expiry
 from app.device_registry import DeviceConnectionRegistry
@@ -97,9 +97,11 @@ async def live() -> dict[str, str]:
 @app.get("/health/ready", tags=["health"])
 async def ready(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
     try:
-        await session.execute(text("SELECT 1"))
+        schema_ready = await has_target_schema(session)
     except Exception as error:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="database unavailable") from error
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="service unavailable") from error
+    if not schema_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="service unavailable")
     return {"status": "ok"}
 
 

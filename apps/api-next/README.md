@@ -46,12 +46,14 @@ cd apps/api-next
 .\.venv\Scripts\python.exe -m app.preflight
 if ($LASTEXITCODE -ne 0) { throw "API production preflight failed" }
 alembic upgrade head
+.\.venv\Scripts\python.exe -m app.release_check
+if ($LASTEXITCODE -ne 0) { throw "API online release check failed" }
 uvicorn app.main:app --host 127.0.0.1 --port 8081
 ```
 
-The preflight performs no network or database connection. It prints only field-level validation reasons and never configuration values or secrets. `/health/live` remains a process liveness check; `/health/ready` performs only `SELECT 1` and returns the fixed `database unavailable` detail on failure, without exposing connection strings or driver errors. Deployment orchestration should keep the instance out of service until both the preflight and readiness probe succeed.
+The preflight performs no network or database connection. It prints only field-level validation reasons and never configuration values or secrets. The online release check repeats production preflight, connects read-only, and requires `alembic_version` to contain exactly the supported revision `20260804_0001`; it never migrates or writes the database. `/health/live` remains a process liveness check. `/health/ready` applies the same exact revision contract and returns only `service unavailable` for connection, missing-table, empty, old, wrong or multi-revision states. Keep the instance out of service until preflight, migration, online check and readiness all succeed.
 
-The current acceptance baseline is 72 passing regular pytest tests, six environment-gated PostgreSQL integration tests, and a clean Ruff check. The migration lifecycle, real `PostgresStore` lifecycle, same-process localhost WebSocket reconnect, subprocess uvicorn restart, custom-format backup/restore, and localhost TLS/WSS certificate-validation integrations have all been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic, a production-matched database drill, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
+The current acceptance baseline is 82 passing regular pytest tests, six environment-gated PostgreSQL integration tests, and a clean Ruff check. The migration lifecycle, real `PostgresStore` lifecycle, same-process localhost WebSocket reconnect, subprocess uvicorn restart, custom-format backup/restore, and localhost TLS/WSS certificate-validation integrations have all been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic, a production-matched database drill, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
 
 To repeat the destructive migration check safely, supply an administrative URL for an existing PostgreSQL instance. The test creates a random dedicated login/database, runs upgrade/downgrade/re-upgrade only there, terminates its own remaining connections, and removes both objects in `finally`. It never prints or stores the password:
 
