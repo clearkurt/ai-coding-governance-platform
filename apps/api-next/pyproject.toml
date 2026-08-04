@@ -18,10 +18,10 @@ dependencies = [
 include = ["app*"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1"]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1", "websockets>=15,<18"]
 
 [dependency-groups]
-dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1"]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1", "websockets>=15,<18"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

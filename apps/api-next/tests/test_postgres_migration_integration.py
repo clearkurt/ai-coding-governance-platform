@@ -1,16 +1,21 @@
 import asyncio
+import json
 import os
+import socket
 import uuid
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from alembic import command
-from app.db.models import Team, User
+from app.db.models import TaskEvent, Team, User
+from app.device_registry import DeviceConnectionRegistry
+from app.main import app, websocket_store
 from app.security import utcnow
 from app.store import PostgresStore
 
@@ -220,6 +225,147 @@ def test_real_postgres_store_lifecycle(migrated_postgres_url: str) -> None:
                     "task.rollback_succeeded",
                 } <= audit_types
         finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_localhost_websocket_reconnect_replays_and_deduplicates(migrated_postgres_url: str) -> None:
+    async def exercise() -> None:
+        import uvicorn
+        import websockets
+
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            team = Team(slug=f"socket-{uuid.uuid4().hex}", name="Socket")
+            session.add(team)
+            await session.flush()
+            user = User(team_id=team.id, email="socket@example.test", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            team_id, user_email = team.id, user.email
+            await session.commit()
+            store = PostgresStore(session)
+            identity = await store.find_user(team_id, user_email)
+            await store.create_pairing_code(identity, "socket-pair", utcnow() + timedelta(minutes=5))
+            device, credential, projects = await store.consume_pairing_code(
+                "socket-pair", "socket-device", "socket-key", "runtime", ["Socket project"]
+            )
+            conversation = await store.create_conversation(identity, "Socket lifecycle")
+            task, _ = await store.create_task(
+                identity, device.id, projects[0].id, conversation.id, "socket-task", "prompt"
+            )
+
+        async def override_store():
+            return PostgresStore(sessions())
+
+        old_registry = app.state.device_registry
+        app.state.device_registry = DeviceConnectionRegistry()
+        app.dependency_overrides[websocket_store] = override_store
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off"))
+        server_task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(100):
+                if server.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert server.started
+            uri = f"ws://127.0.0.1:{port}/ws/devices"
+            auth = {"type": "authenticate", "device_id": str(device.id), "credential": credential}
+
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                assert json.loads(await ws.recv())["type"] == "authenticated"
+                first_delivery = json.loads(await ws.recv())
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                await ws.recv()
+                replay = json.loads(await ws.recv())
+                assert replay["task_id"] == first_delivery["task_id"]
+                assert replay["delivery_id"] == first_delivery["delivery_id"]
+                await ws.send(
+                    json.dumps({"type": "task.dispatch.ack", "task_id": str(task.id), "delivery_id": task.delivery_id})
+                )
+                assert json.loads(await ws.recv())["accepted"] is True
+                event = {
+                    "type": "task.event",
+                    "task_id": str(task.id),
+                    "source_event_id": "socket-event",
+                    "event_type": "text.delta",
+                    "payload": {"text": "x"},
+                }
+                await ws.send(json.dumps(event))
+                await asyncio.sleep(0.05)
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                await ws.recv()
+                await ws.recv()
+                await ws.send(json.dumps(event))
+                event_ack = json.loads(await ws.recv())
+                assert event_ack["source_event_id"] == "socket-event" and event_ack["sequence"] == 1
+
+            async with sessions() as session:
+                store = PostgresStore(session)
+                assert (
+                    await session.scalar(
+                        select(func.count()).select_from(TaskEvent).where(TaskEvent.task_id == task.id)
+                    )
+                    == 1
+                )
+                approval_event = await store.append_event(
+                    device, task.id, "socket-approval", "item/commandExecution/requestApproval", {"request_id": 42}
+                )
+                approval = (await store.list_approvals(task.id, identity))[0]
+                decided, _ = await store.decide_approval(approval.id, identity, "approved")
+                assert approval_event.sequence == 2
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                await ws.recv()
+                await ws.recv()
+                approval_delivery = json.loads(await ws.recv())
+                assert approval_delivery["delivery_id"] == decided.decision_delivery_id
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "approval.decision.ack",
+                            "approval_id": str(approval.id),
+                            "delivery_id": decided.decision_delivery_id,
+                        }
+                    )
+                )
+                assert json.loads(await ws.recv())["accepted"] is True
+
+            async with sessions() as session:
+                store = PostgresStore(session)
+                await store.append_event(device, task.id, "socket-complete", "turn/completed", {})
+                rollback, _ = await store.request_rollback(task.id, identity)
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                await ws.recv()
+                rollback_delivery = json.loads(await ws.recv())
+                assert rollback_delivery["delivery_id"] == rollback.delivery_id
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "task.rollback.ack",
+                            "task_id": str(task.id),
+                            "delivery_id": rollback.delivery_id,
+                            "status": "succeeded",
+                        }
+                    )
+                )
+                assert json.loads(await ws.recv())["accepted"] is True
+        finally:
+            server.should_exit = True
+            await server_task
+            app.dependency_overrides.pop(websocket_store, None)
+            app.state.device_registry = old_registry
             await engine.dispose()
 
     asyncio.run(exercise())
