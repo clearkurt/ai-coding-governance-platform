@@ -1,45 +1,41 @@
-# Rust 本地 Agent
+# Windows local daemon
 
-`company-agent` 是受控的 Windows 本地执行器：它只会通过反向 WebSocket 接收任务，并且只可访问工程师在配对时本地选择的目录。
+`company-agent` is the Windows device bridge for the target Codex architecture. It owns pairing, Credential Manager access, the validated WSS connection, task shadow workspaces, backups, audit forwarding, and the pinned Codex App Server lifecycle.
 
-## 开发构建
-
-本机使用 Rust GNU 目标（因为开发机未安装 MSVC Build Tools）：
+## Development
 
 ```powershell
 cd apps/agent
 $env:PATH = "C:\msys64\ucrt64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-cargo +stable-x86_64-pc-windows-gnu test
-cargo +stable-x86_64-pc-windows-gnu build --release
+cargo test
+cargo build --release
 ```
 
-产物为 `target/x86_64-pc-windows-gnu/release/company-agent.exe` 与 `agent-updater.exe`。
-
-## 本地配对
-
-1. 登录网页，在“本地 Agent”区创建一次性配对码。
-2. 执行：
+## Pairing
 
 ```powershell
-company-agent.exe enroll --server ws://localhost:3000 --code <配对码>
+company-agent.exe enroll --server ws://localhost:8000 --code <pairing-code>
 company-agent.exe run
 ```
 
-配对时会弹出目录选择窗口；Agent 凭据保存到 Windows Credential Manager，配置文件不保存明文凭据。
+Use `--legacy` on `enroll` only when pairing against the legacy `/api/agent/ws` endpoint.
 
-`ws://` 只允许 `localhost`/`127.0.0.1`，内网部署必须使用 `wss://`。
+## Installing a managed Codex release
 
-## Codex App Server 模式
-
-新模式只接受产品分发的固定 Codex 可执行文件绝对路径，不从 `PATH` 或 WindowsApps 商店目录启动。配置前可同时提供发布清单中的 SHA-256：
+`configure-codex` no longer accepts an executable that will be launched in place, and SHA-256 is no longer optional. The operator must supply every field from the approved company release record:
 
 ```powershell
-company-agent.exe configure-codex --executable C:\ProgramData\CompanyAgent\runtime\codex.exe --sha256 <发布哈希>
-company-agent.exe run
+company-agent.exe configure-codex `
+  --artifact D:\staging\codex.exe `
+  --version 0.145.0-alpha.27 `
+  --sha256 <64-hex-release-sha256> `
+  --schema-version app-server-schema-1 `
+  --model-catalog-version deepseek-v4-flash-1 `
+  --config-template-version company-responses-1
 ```
 
-守护进程会校验固定版本，通过 `app-server --stdio --strict-config` 启动子进程，并用 Windows Job Object 保证退出时终止整个进程树。任务中的 `root_id` 必须匹配配对时授权的根目录。需要临时回退旧执行器时运行：
+The values above are the exact compatibility contract supported by this daemon build; arbitrary non-empty alternatives are rejected. The artifact path is installation input only. The daemon verifies its hash and exact `codex-cli <version>` output, atomically installs it below the daemon application-data directory, and stores only the release manifest in `agent.json`. Every startup reloads the installed manifest and rechecks the managed artifact hash and version before spawning App Server. It never searches `PATH`, launches the staging path, or accepts an omitted hash.
 
-```powershell
-company-agent.exe use-legacy
-```
+Existing development configurations using `--executable` must be reinstalled with the command above. `company-agent use-legacy` remains available and can clear even an old Codex configuration shape.
+
+See [runtime-pinning-security.md](../../docs/runtime-pinning-security.md) and [shadow-workspace-security.md](../../docs/shadow-workspace-security.md) for security boundaries.

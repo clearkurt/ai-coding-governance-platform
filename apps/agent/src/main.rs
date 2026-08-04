@@ -46,10 +46,21 @@ enum Command {
     Run,
     Status,
     ConfigureCodex {
+        #[arg(
+            long,
+            help = "Release artifact to verify and install; it is never used in-place"
+        )]
+        artifact: PathBuf,
         #[arg(long)]
-        executable: PathBuf,
+        version: String,
         #[arg(long)]
-        sha256: Option<String>,
+        sha256: String,
+        #[arg(long)]
+        schema_version: String,
+        #[arg(long)]
+        model_catalog_version: String,
+        #[arg(long)]
+        config_template_version: String,
     },
     UseLegacy,
     #[command(hide = true)]
@@ -74,17 +85,9 @@ struct Config {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct CodexSettings {
-    executable: PathBuf,
-    #[serde(default = "default_codex_version")]
-    expected_version: String,
-    #[serde(default)]
-    expected_sha256: Option<String>,
+    release: codex_bridge::ReleaseManifest,
     #[serde(default = "default_request_timeout_seconds")]
     request_timeout_seconds: u64,
-}
-
-fn default_codex_version() -> String {
-    codex_bridge::PINNED_PROTOCOL_VERSION.into()
 }
 
 fn default_request_timeout_seconds() -> u64 {
@@ -387,9 +390,8 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
     let data_dir = agent_data_dir()?;
     let current_exe = fs::canonicalize(std::env::current_exe()?)?;
     let runtime = codex_bridge::RuntimeConfig {
-        executable: settings.executable,
-        expected_version: settings.expected_version,
-        expected_sha256: settings.expected_sha256,
+        managed_runtime_dir: data_dir.join("runtime"),
+        release: settings.release,
         request_timeout: Duration::from_secs(settings.request_timeout_seconds.clamp(1, 300)),
         codex_home: data_dir.join("codex-home"),
         responses_base_url: format!("{}/v1", http_server_url(&config.server)?),
@@ -889,20 +891,19 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn configure_codex(executable: PathBuf, sha256: Option<String>) -> Result<()> {
+fn configure_codex(artifact: PathBuf, release: codex_bridge::ReleaseManifest) -> Result<()> {
     let (mut config, _) = load_config()?;
     let settings = CodexSettings {
-        executable,
-        expected_version: default_codex_version(),
-        expected_sha256: sha256,
+        release: release.clone(),
         request_timeout_seconds: default_request_timeout_seconds(),
     };
+    let data_dir = agent_data_dir()?;
+    codex_bridge::install_release(&data_dir.join("runtime"), &artifact, &release)?;
     codex_bridge::RuntimeConfig {
-        executable: settings.executable.clone(),
-        expected_version: settings.expected_version.clone(),
-        expected_sha256: settings.expected_sha256.clone(),
+        managed_runtime_dir: data_dir.join("runtime"),
+        release,
         request_timeout: Duration::from_secs(settings.request_timeout_seconds),
-        codex_home: agent_data_dir()?.join("codex-home"),
+        codex_home: data_dir.join("codex-home"),
         responses_base_url: format!("{}/v1", http_server_url(&config.server)?),
         auth_command: fs::canonicalize(std::env::current_exe()?)?,
     }
@@ -914,9 +915,10 @@ fn configure_codex(executable: PathBuf, sha256: Option<String>) -> Result<()> {
 }
 
 fn use_legacy() -> Result<()> {
-    let (mut config, _) = load_config()?;
-    config.codex = None;
-    fs::write(config_path()?, serde_json::to_vec_pretty(&config)?)?;
+    let path = config_path()?;
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    value["codex"] = serde_json::Value::Null;
+    fs::write(path, serde_json::to_vec_pretty(&value)?)?;
     println!("Legacy executor selected; restart company-agent run to activate it.");
     Ok(())
 }
@@ -933,7 +935,23 @@ async fn main() -> Result<()> {
         } => enroll(server, code, name, legacy).await,
         Command::Run => run().await,
         Command::Status => status(),
-        Command::ConfigureCodex { executable, sha256 } => configure_codex(executable, sha256),
+        Command::ConfigureCodex {
+            artifact,
+            version,
+            sha256,
+            schema_version,
+            model_catalog_version,
+            config_template_version,
+        } => configure_codex(
+            artifact,
+            codex_bridge::ReleaseManifest {
+                version,
+                sha256,
+                schema_version,
+                model_catalog_version,
+                config_template_version,
+            },
+        ),
         Command::UseLegacy => use_legacy(),
         Command::ModelToken => model_token().await,
     }

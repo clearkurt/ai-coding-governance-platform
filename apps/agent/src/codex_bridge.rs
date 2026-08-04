@@ -2,7 +2,7 @@
 //! sandbox path until the server-side migration feature switch is enabled.
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -69,13 +69,24 @@ impl Drop for KillOnCloseJob {
 }
 
 pub const PINNED_PROTOCOL_VERSION: &str = "0.145.0-alpha.27";
+pub const PINNED_APP_SERVER_SCHEMA_VERSION: &str = "app-server-schema-1";
+pub const PINNED_MODEL_CATALOG_VERSION: &str = "deepseek-v4-flash-1";
+pub const PINNED_CONFIG_TEMPLATE_VERSION: &str = "company-responses-1";
 const STDERR_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseManifest {
+    pub version: String,
+    pub sha256: String,
+    pub schema_version: String,
+    pub model_catalog_version: String,
+    pub config_template_version: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    pub executable: PathBuf,
-    pub expected_version: String,
-    pub expected_sha256: Option<String>,
+    pub managed_runtime_dir: PathBuf,
+    pub release: ReleaseManifest,
     pub request_timeout: Duration,
     pub codex_home: PathBuf,
     pub responses_base_url: String,
@@ -112,25 +123,34 @@ struct ManagedAuth {
 
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<PathBuf> {
-        if !self.executable.is_absolute() {
-            bail!("Codex runtime path must be absolute")
+        validate_release_manifest(&self.release)?;
+        if !self.managed_runtime_dir.is_absolute() {
+            bail!("managed runtime directory must be absolute")
         }
-        let executable = self
-            .executable
+        let release_dir = self
+            .managed_runtime_dir
+            .join("releases")
+            .join(&self.release.version);
+        let installed: ReleaseManifest = serde_json::from_slice(
+            &std::fs::read(release_dir.join("release.json"))
+                .context("installed Codex release manifest is missing")?,
+        )?;
+        if installed != self.release {
+            bail!("installed Codex release manifest does not match configured pin")
+        }
+        let executable = release_dir
+            .join(if cfg!(windows) { "codex.exe" } else { "codex" })
             .canonicalize()
             .context("pinned Codex runtime is missing")?;
         if !executable.is_file() {
             bail!("pinned Codex runtime is not a file")
         }
-        let normalized = executable.to_string_lossy().to_ascii_lowercase();
-        if normalized.contains("\\windowsapps\\") {
-            bail!("WindowsApps Codex runtime is not an allowed product runtime")
+        if !executable.starts_with(self.managed_runtime_dir.canonicalize()?) {
+            bail!("Codex runtime escaped the company-managed directory")
         }
-        if let Some(expected) = &self.expected_sha256 {
-            let actual = hex_sha256(&std::fs::read(&executable)?);
-            if !actual.eq_ignore_ascii_case(expected) {
-                bail!("pinned Codex runtime SHA-256 mismatch")
-            }
+        let actual = hex_sha256(&std::fs::read(&executable)?);
+        if !actual.eq_ignore_ascii_case(&self.release.sha256) {
+            bail!("pinned Codex runtime SHA-256 mismatch")
         }
         Ok(executable)
     }
@@ -177,6 +197,108 @@ impl RuntimeConfig {
         std::fs::rename(temporary, target)?;
         Ok(())
     }
+}
+
+pub fn validate_release_manifest(release: &ReleaseManifest) -> Result<()> {
+    for (name, actual, expected) in [
+        ("version", release.version.as_str(), PINNED_PROTOCOL_VERSION),
+        (
+            "schema_version",
+            release.schema_version.as_str(),
+            PINNED_APP_SERVER_SCHEMA_VERSION,
+        ),
+        (
+            "model_catalog_version",
+            release.model_catalog_version.as_str(),
+            PINNED_MODEL_CATALOG_VERSION,
+        ),
+        (
+            "config_template_version",
+            release.config_template_version.as_str(),
+            PINNED_CONFIG_TEMPLATE_VERSION,
+        ),
+    ] {
+        if actual != expected {
+            bail!("release {name} must equal this daemon's supported value {expected}")
+        }
+    }
+    if release.sha256.len() != 64 || !release.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("release SHA-256 must contain exactly 64 hexadecimal characters")
+    }
+    Ok(())
+}
+
+fn codex_version_matches(stdout: &[u8], expected: &str) -> bool {
+    let Ok(output) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let mut tokens = output.split_whitespace();
+    matches!(
+        (tokens.next(), tokens.next(), tokens.next()),
+        (Some("codex-cli"), Some(version), None) if version == expected
+    )
+}
+
+pub fn install_release(
+    managed_runtime_dir: &Path,
+    artifact: &Path,
+    release: &ReleaseManifest,
+) -> Result<PathBuf> {
+    validate_release_manifest(release)?;
+    if !managed_runtime_dir.is_absolute() {
+        bail!("managed runtime directory must be absolute")
+    }
+    if !artifact.is_file() {
+        bail!("Codex release artifact is missing")
+    }
+    let actual = hex_sha256(&std::fs::read(artifact)?);
+    if !actual.eq_ignore_ascii_case(&release.sha256) {
+        bail!("Codex release artifact SHA-256 mismatch")
+    }
+    let output = std::process::Command::new(artifact)
+        .arg("--version")
+        .output()
+        .context("failed to verify Codex release version")?;
+    if !output.status.success() || !codex_version_matches(&output.stdout, &release.version) {
+        bail!("Codex release version mismatch")
+    }
+    std::fs::create_dir_all(managed_runtime_dir.join("releases"))?;
+    let final_dir = managed_runtime_dir.join("releases").join(&release.version);
+    let temporary = managed_runtime_dir
+        .join("releases")
+        .join(format!(".install-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&temporary)?;
+    let executable = temporary.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    let result = (|| {
+        std::fs::copy(artifact, &executable)?;
+        if hex_sha256(&std::fs::read(&executable)?) != actual {
+            bail!("installed Codex artifact verification failed")
+        };
+        std::fs::write(
+            temporary.join("release.json"),
+            serde_json::to_vec_pretty(release)?,
+        )?;
+        let previous = managed_runtime_dir
+            .join("releases")
+            .join(format!(".previous-{}", uuid::Uuid::new_v4()));
+        if final_dir.exists() {
+            std::fs::rename(&final_dir, &previous)?;
+        }
+        if let Err(error) = std::fs::rename(&temporary, &final_dir) {
+            if previous.exists() {
+                let _ = std::fs::rename(&previous, &final_dir);
+            }
+            return Err(error.into());
+        }
+        if previous.exists() {
+            let _ = std::fs::remove_dir_all(previous);
+        }
+        Ok(final_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" }))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+    result
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -237,8 +359,9 @@ impl CodexAppServer {
             .output()
             .await
             .context("failed to check pinned Codex version")?;
-        let actual = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !actual.contains(&config.expected_version) {
+        if !output.status.success()
+            || !codex_version_matches(&output.stdout, &config.release.version)
+        {
             bail!("pinned Codex version does not match configured version")
         }
         let mut child = Command::new(executable)
@@ -490,6 +613,10 @@ mod tests {
     use std::{fs, process::Command as StdCommand};
 
     fn compile_mock_server() -> PathBuf {
+        compile_mock_server_with_version(PINNED_PROTOCOL_VERSION)
+    }
+
+    fn compile_mock_server_with_version(version: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("codex-mock-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("mock.rs");
@@ -498,7 +625,7 @@ mod tests {
         } else {
             "mock-codex"
         });
-        fs::write(&source, r###"
+        let source_text = r###"
 use std::io::{self, BufRead};
 fn id(line: &str) -> u64 {
     let marker = "\"id\":";
@@ -506,7 +633,7 @@ fn id(line: &str) -> u64 {
     line[start..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
 }
 fn main() {
-    if std::env::args().any(|arg| arg == "--version") { println!("codex-cli 0.145.0-alpha.27"); return; }
+    if std::env::args().any(|arg| arg == "--version") { println!("codex-cli __MOCK_VERSION__"); return; }
     let mut slow = None;
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -526,7 +653,9 @@ fn main() {
         else if !line.contains("\"method\":\"timeout\"") { println!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, request_id); }
     }
 }
-"###).unwrap();
+"###
+        .replace("__MOCK_VERSION__", version);
+        fs::write(&source, source_text).unwrap();
         let status = StdCommand::new("rustc")
             .arg(&source)
             .arg("-o")
@@ -539,10 +668,19 @@ fn main() {
 
     fn mock_config(executable: PathBuf, timeout: Duration) -> RuntimeConfig {
         let codex_home = std::env::temp_dir().join(format!("codex-home-{}", uuid::Uuid::new_v4()));
+        let managed_runtime_dir =
+            std::env::temp_dir().join(format!("codex-runtime-{}", uuid::Uuid::new_v4()));
+        let release = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: hex_sha256(&fs::read(&executable).unwrap()),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        install_release(&managed_runtime_dir, &executable, &release).unwrap();
         RuntimeConfig {
-            executable,
-            expected_version: PINNED_PROTOCOL_VERSION.into(),
-            expected_sha256: None,
+            managed_runtime_dir,
+            release,
             request_timeout: timeout,
             codex_home,
             responses_base_url: "http://localhost:8081/v1".into(),
@@ -552,15 +690,129 @@ fn main() {
     #[test]
     fn rejects_relative_and_store_runtime_paths() {
         let config = RuntimeConfig {
-            executable: PathBuf::from("codex.exe"),
-            expected_version: PINNED_PROTOCOL_VERSION.into(),
-            expected_sha256: None,
+            managed_runtime_dir: PathBuf::from("runtime"),
+            release: ReleaseManifest {
+                version: PINNED_PROTOCOL_VERSION.into(),
+                sha256: "0".repeat(64),
+                schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+                model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+                config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+            },
             request_timeout: Duration::from_secs(1),
             codex_home: std::env::temp_dir().join("codex-test-home"),
             responses_base_url: "http://localhost:8081/v1".into(),
             auth_command: std::env::current_exe().unwrap(),
         };
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn release_manifest_requires_exact_build_contract() {
+        let valid = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: "a".repeat(64),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        assert!(validate_release_manifest(&valid).is_ok());
+        let mut missing_hash = valid.clone();
+        missing_hash.sha256.clear();
+        assert!(validate_release_manifest(&missing_hash).is_err());
+        let mut bad_hash = valid.clone();
+        bad_hash.sha256 = "z".repeat(64);
+        assert!(validate_release_manifest(&bad_hash).is_err());
+        for mutate in [
+            |release: &mut ReleaseManifest| release.version = "0.145.0".into(),
+            |release: &mut ReleaseManifest| release.schema_version = "arbitrary".into(),
+            |release: &mut ReleaseManifest| release.model_catalog_version = "arbitrary".into(),
+            |release: &mut ReleaseManifest| release.config_template_version = "arbitrary".into(),
+        ] {
+            let mut mismatched = valid.clone();
+            mutate(&mut mismatched);
+            assert!(validate_release_manifest(&mismatched).is_err());
+        }
+    }
+    #[test]
+    fn version_probe_rejects_substrings_and_extra_tokens() {
+        assert!(codex_version_matches(
+            b"codex-cli 0.145.0-alpha.27\n",
+            PINNED_PROTOCOL_VERSION
+        ));
+        assert!(!codex_version_matches(
+            b"codex-cli 0.145.0-alpha.270\n",
+            PINNED_PROTOCOL_VERSION
+        ));
+        assert!(!codex_version_matches(
+            b"wrapper codex-cli 0.145.0-alpha.27\n",
+            PINNED_PROTOCOL_VERSION
+        ));
+    }
+    #[test]
+    fn install_is_managed_and_runtime_detects_tampering() {
+        let artifact = compile_mock_server();
+        let managed =
+            std::env::temp_dir().join(format!("managed-runtime-{}", uuid::Uuid::new_v4()));
+        let release = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: hex_sha256(&fs::read(&artifact).unwrap()),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        let installed = install_release(&managed, &artifact, &release).unwrap();
+        assert!(installed.starts_with(&managed));
+        assert_ne!(installed, artifact);
+        let config = RuntimeConfig {
+            managed_runtime_dir: managed.clone(),
+            release: release.clone(),
+            request_timeout: Duration::from_secs(1),
+            codex_home: managed.join("home"),
+            responses_base_url: "http://localhost:8081/v1".into(),
+            auth_command: std::env::current_exe().unwrap(),
+        };
+        assert_eq!(
+            config.validate().unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        fs::write(&installed, b"tampered").unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256")
+        );
+        fs::remove_dir_all(managed).unwrap();
+    }
+    #[test]
+    fn install_rejects_hash_and_version_mismatch() {
+        let artifact = compile_mock_server();
+        let managed =
+            std::env::temp_dir().join(format!("managed-runtime-{}", uuid::Uuid::new_v4()));
+        let mut release = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: "0".repeat(64),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        assert!(
+            install_release(&managed, &artifact, &release)
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256")
+        );
+        release.sha256 = hex_sha256(&fs::read(&artifact).unwrap());
+        let wrong_path = compile_mock_server_with_version("0.145.0-alpha.270");
+        release.sha256 = hex_sha256(&fs::read(&wrong_path).unwrap());
+        assert!(
+            install_release(&managed, &wrong_path, &release)
+                .unwrap_err()
+                .to_string()
+                .contains("version mismatch")
+        );
+        let _ = fs::remove_file(wrong_path);
+        let _ = fs::remove_dir_all(managed);
     }
     #[test]
     fn notification_event_ids_are_stable_and_approval_is_detected() {
@@ -575,9 +827,14 @@ fn main() {
         let dir =
             std::env::temp_dir().join(format!("codex-managed-config-{}", uuid::Uuid::new_v4()));
         let config = RuntimeConfig {
-            executable: std::env::current_exe().unwrap(),
-            expected_version: PINNED_PROTOCOL_VERSION.into(),
-            expected_sha256: None,
+            managed_runtime_dir: std::env::temp_dir().join("unused-runtime"),
+            release: ReleaseManifest {
+                version: PINNED_PROTOCOL_VERSION.into(),
+                sha256: "0".repeat(64),
+                schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+                model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+                config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+            },
             request_timeout: Duration::from_secs(1),
             codex_home: dir.clone(),
             responses_base_url: "https://agent.example/v1".into(),
