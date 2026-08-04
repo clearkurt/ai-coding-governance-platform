@@ -12,7 +12,7 @@ This is a mixed TypeScript/Rust monorepo for an internal AI coding assistant.
 
 Keep browser-facing logic in `web`, server authorization and audit logic in `api`, and local filesystem enforcement in `agent`. Do not move local-path trust decisions to the server.
 
-## Confirmed Target Architecture (Not Yet Implemented)
+## Confirmed Target Architecture (Implemented in Parallel, Not Yet Production-Cut Over)
 
 The project is moving from a custom server-side LLM tool loop plus Rust executor to a Codex-based local agent runtime:
 
@@ -38,7 +38,7 @@ The confirmed target application stack is:
 
 Do not introduce React or Fastify into new target-architecture work unless this decision is explicitly revisited. Existing React/Fastify/SQLite code is the legacy implementation and may remain during migration.
 
-This is an approved architectural direction, not a description of the current implementation. Before changing code, read `docs/codex-deepseek-target.md` and preserve a rollback path during migration.
+The target slices are implemented in parallel, but production-environment acceptance is incomplete and the legacy path remains the default. Before changing code, read `docs/codex-deepseek-target.md` and `docs/rollout-acceptance.md`, and preserve a rollback path during migration. Do not switch the root package scripts or remove the legacy path until those gates pass.
 
 ## Build, Test, and Development Commands
 
@@ -60,6 +60,8 @@ cargo test
 cargo run -- run
 ```
 
+For the parallel target applications, use the commands documented in `apps/api-next/README.md` and `apps/web-next/README.md`. The target acceptance suite includes `pytest`, `ruff check .`, Vitest, the Vue production build, and Playwright. Root npm commands intentionally continue to validate the legacy path.
+
 The Agent pins its GNU Rust toolchain in `rust-toolchain.toml`; use it rather than the MSVC default on this development machine.
 
 ## Coding Style & Naming Conventions
@@ -68,7 +70,7 @@ Use TypeScript strict mode and keep API validation in Zod at request boundaries.
 
 ## Testing Guidelines
 
-Run `npm run build`, `npm test`, and `cargo test` before committing. Add API smoke coverage when changing authentication, device pairing, task status, or permissions. Add Rust unit tests for path traversal, file limits, task deduplication, and write preconditions. Do not test against real user projects; use temporary directories.
+Run the tests appropriate to every touched path before committing. For legacy changes run `npm run build` and `npm test`; for target API changes run `pytest` and `ruff check .`; for target web changes run Vitest, the production build, and Playwright; for daemon changes run `cargo test`. Add API coverage when changing authentication, device pairing, task status, or permissions. Add Rust unit tests for path traversal, file limits, task deduplication, and write preconditions. Do not test against real user projects; use temporary directories.
 
 ## Commit & Pull Request Guidelines
 

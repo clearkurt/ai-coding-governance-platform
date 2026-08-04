@@ -1,6 +1,6 @@
 # New FastAPI control plane
 
-This directory is the parallel replacement for the legacy Fastify + SQLite API. It is not yet wired into production traffic.
+This directory is the parallel replacement for the legacy Fastify + SQLite API. Its target control-plane slice is implemented and locally tested, but it is not wired into production traffic and is not production-ready.
 
 ## Local development
 
@@ -14,6 +14,7 @@ python -m pip install -e ".[dev]"
 alembic upgrade head
 uvicorn app.main:app --reload --port 8081
 pytest
+ruff check .
 ```
 
 The API has `GET /health/live` and `GET /health/ready`. The readiness endpoint checks the configured PostgreSQL connection without logging credentials.
@@ -33,3 +34,5 @@ Logged-in users create a ten-minute single-use code with `POST /pairing-codes`. 
 Approval decisions and rollback requests use stable delivery identifiers, replay after device reconnect, and remain pending until the device ACKs them. `GET /tasks/{id}/audit` exposes task-scoped audit metadata to an authorized project member. `POST /tasks/{id}/rollback` is available only for terminal tasks and asks the local daemon to restore its retained pre-turn snapshot.
 
 For local HTTP development set `COMPANY_AGENT_SESSION_COOKIE_SECURE=false`. Production must use HTTPS/WSS and leave secure cookies enabled.
+
+The current acceptance baseline is 23 passing pytest tests and a clean Ruff check. Real PostgreSQL upgrade/downgrade, real DeepSeek Responses traffic, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
