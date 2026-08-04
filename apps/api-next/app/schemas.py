@@ -65,3 +65,19 @@ class DeviceEventMessage(BaseModel):
     source_event_id: str = Field(min_length=1, max_length=255)
     event_type: str = Field(min_length=1, max_length=80)
     payload: dict[str, Any]
+
+
+class ModelTokenRequest(BaseModel):
+    task_id: UUID
+    model: str = "deepseek-v4-flash"
+
+
+class ModelTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    model: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    decision: str

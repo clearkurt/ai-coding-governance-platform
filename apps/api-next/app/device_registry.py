@@ -28,17 +28,23 @@ class DeviceConnectionRegistry:
                 self._connections.pop(device_id, None)
 
     async def deliver(self, task: TaskIdentity) -> bool:
+        return await self.send(
+            task.device_id,
+            {
+                "type": "task.dispatch",
+                "task_id": str(task.id),
+                "project_id": str(task.project_id),
+                "conversation_id": str(task.conversation_id),
+                "root_id": task.root_id,
+                "prompt": task.prompt,
+                "delivery_id": task.delivery_id,
+            },
+        )
+
+    async def send(self, device_id: uuid.UUID, payload: dict[str, object]) -> bool:
         async with self._lock:
-            websocket = self._connections.get(task.device_id)
+            websocket = self._connections.get(device_id)
         if not websocket:
             return False
-        await websocket.send_json({
-            "type": "task.dispatch",
-            "task_id": str(task.id),
-            "project_id": str(task.project_id),
-            "conversation_id": str(task.conversation_id),
-            "root_id": task.root_id,
-            "prompt": task.prompt,
-            "delivery_id": task.delivery_id,
-        })
+        await websocket.send_json(payload)
         return True

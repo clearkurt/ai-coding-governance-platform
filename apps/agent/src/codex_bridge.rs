@@ -2,6 +2,7 @@
 //! sandbox path until the server-side migration feature switch is enabled.
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -76,6 +77,37 @@ pub struct RuntimeConfig {
     pub expected_version: String,
     pub expected_sha256: Option<String>,
     pub request_timeout: Duration,
+    pub codex_home: PathBuf,
+    pub responses_base_url: String,
+    pub auth_command: PathBuf,
+}
+
+#[derive(Serialize)]
+struct ManagedCodexConfig {
+    model: String,
+    model_provider: String,
+    approval_policy: String,
+    sandbox_mode: String,
+    sandbox_workspace_write: ManagedWorkspaceWrite,
+    model_providers: BTreeMap<String, ManagedProvider>,
+}
+#[derive(Serialize)]
+struct ManagedWorkspaceWrite {
+    network_access: bool,
+}
+#[derive(Serialize)]
+struct ManagedProvider {
+    name: String,
+    base_url: String,
+    wire_api: String,
+    auth: ManagedAuth,
+}
+#[derive(Serialize)]
+struct ManagedAuth {
+    command: String,
+    args: Vec<String>,
+    refresh_interval_ms: u64,
+    timeout_ms: u64,
 }
 
 impl RuntimeConfig {
@@ -101,6 +133,49 @@ impl RuntimeConfig {
             }
         }
         Ok(executable)
+    }
+
+    fn write_managed_config(&self) -> Result<()> {
+        if !self.codex_home.is_absolute() || !self.auth_command.is_absolute() {
+            bail!("managed Codex paths must be absolute")
+        }
+        if !(self.responses_base_url.starts_with("https://")
+            || self.responses_base_url.starts_with("http://localhost")
+            || self.responses_base_url.starts_with("http://127.0.0.1"))
+        {
+            bail!("Responses proxy must use HTTPS or localhost HTTP")
+        }
+        std::fs::create_dir_all(&self.codex_home)?;
+        let provider = ManagedProvider {
+            name: "Company DeepSeek".into(),
+            base_url: self.responses_base_url.trim_end_matches('/').into(),
+            wire_api: "responses".into(),
+            auth: ManagedAuth {
+                command: self.auth_command.to_string_lossy().into_owned(),
+                args: vec!["model-token".into()],
+                refresh_interval_ms: 0,
+                timeout_ms: 5_000,
+            },
+        };
+        let config = ManagedCodexConfig {
+            model: "deepseek-v4-flash".into(),
+            model_provider: "company".into(),
+            approval_policy: "on-request".into(),
+            sandbox_mode: "workspace-write".into(),
+            sandbox_workspace_write: ManagedWorkspaceWrite {
+                network_access: false,
+            },
+            model_providers: BTreeMap::from([("company".into(), provider)]),
+        };
+        let bytes = toml::to_string_pretty(&config)?.into_bytes();
+        let target = self.codex_home.join("config.toml");
+        let temporary = self.codex_home.join("config.toml.tmp");
+        std::fs::write(&temporary, bytes)?;
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
+        std::fs::rename(temporary, target)?;
+        Ok(())
     }
 }
 
@@ -156,6 +231,7 @@ pub struct CodexAppServer {
 impl CodexAppServer {
     pub async fn start(config: RuntimeConfig) -> Result<Self> {
         let executable = config.validate()?;
+        config.write_managed_config()?;
         let output = Command::new(&executable)
             .arg("--version")
             .output()
@@ -167,6 +243,7 @@ impl CodexAppServer {
         }
         let mut child = Command::new(executable)
             .args(["app-server", "--stdio", "--strict-config"])
+            .env("CODEX_HOME", &config.codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -402,6 +479,9 @@ impl DispatchBook {
                 .then_some(task_id.as_str())
         })
     }
+    pub fn remove(&mut self, task_id: &str) -> bool {
+        self.active.remove(task_id).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -458,11 +538,15 @@ fn main() {
     }
 
     fn mock_config(executable: PathBuf, timeout: Duration) -> RuntimeConfig {
+        let codex_home = std::env::temp_dir().join(format!("codex-home-{}", uuid::Uuid::new_v4()));
         RuntimeConfig {
             executable,
             expected_version: PINNED_PROTOCOL_VERSION.into(),
             expected_sha256: None,
             request_timeout: timeout,
+            codex_home,
+            responses_base_url: "http://localhost:8081/v1".into(),
+            auth_command: std::env::current_exe().unwrap(),
         }
     }
     #[test]
@@ -472,6 +556,9 @@ fn main() {
             expected_version: PINNED_PROTOCOL_VERSION.into(),
             expected_sha256: None,
             request_timeout: Duration::from_secs(1),
+            codex_home: std::env::temp_dir().join("codex-test-home"),
+            responses_base_url: "http://localhost:8081/v1".into(),
+            auth_command: std::env::current_exe().unwrap(),
         };
         assert!(config.validate().is_err());
     }
@@ -482,6 +569,33 @@ fn main() {
         let second = AppNotification::from_value(value, 2).unwrap();
         assert_ne!(first.source_event_id, second.source_event_id);
         assert!(first.is_approval());
+    }
+    #[test]
+    fn managed_config_uses_command_auth_without_embedding_a_token() {
+        let dir =
+            std::env::temp_dir().join(format!("codex-managed-config-{}", uuid::Uuid::new_v4()));
+        let config = RuntimeConfig {
+            executable: std::env::current_exe().unwrap(),
+            expected_version: PINNED_PROTOCOL_VERSION.into(),
+            expected_sha256: None,
+            request_timeout: Duration::from_secs(1),
+            codex_home: dir.clone(),
+            responses_base_url: "https://agent.example/v1".into(),
+            auth_command: std::env::current_exe().unwrap(),
+        };
+        config.write_managed_config().unwrap();
+        let rendered = fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(rendered.contains("model = \"deepseek-v4-flash\""));
+        assert!(rendered.contains("model_provider = \"company\""));
+        assert!(rendered.contains("wire_api = \"responses\""));
+        assert!(rendered.contains("args = [\"model-token\"]"));
+        assert!(rendered.contains("refresh_interval_ms = 0"));
+        assert!(rendered.contains("approval_policy = \"on-request\""));
+        assert!(rendered.contains("sandbox_mode = \"workspace-write\""));
+        assert!(rendered.contains("[sandbox_workspace_write]"));
+        assert!(rendered.contains("network_access = false"));
+        assert!(!rendered.contains("access_token"));
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn duplicate_dispatch_does_not_create_a_second_turn() {

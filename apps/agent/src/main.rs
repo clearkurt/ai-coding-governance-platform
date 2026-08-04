@@ -1,3 +1,4 @@
+mod backup;
 mod codex_bridge;
 mod protocol;
 mod sandbox;
@@ -13,7 +14,12 @@ use protocol::{Envelope, PairPayload, RootRequest};
 use rand::rngs::OsRng;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SERVICE: &str = "company-ai-agent";
@@ -43,6 +49,8 @@ enum Command {
         sha256: Option<String>,
     },
     UseLegacy,
+    #[command(hide = true)]
+    ModelToken,
 }
 #[derive(Serialize, Deserialize, Clone)]
 struct Root {
@@ -84,6 +92,118 @@ fn config_path() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("com", "company", "ai-agent").context("无法定位用户配置目录")?;
     fs::create_dir_all(dirs.config_dir())?;
     Ok(dirs.config_dir().join("agent.json"))
+}
+fn agent_data_dir() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("com", "company", "ai-agent")
+        .context("unable to locate agent data directory")?;
+    fs::create_dir_all(dirs.data_local_dir())?;
+    Ok(dirs.data_local_dir().to_path_buf())
+}
+fn active_task_path() -> Result<PathBuf> {
+    Ok(agent_data_dir()?.join("active-codex-task.json"))
+}
+fn active_task_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct ActiveCodexTask {
+    task_id: String,
+    #[serde(default)]
+    daemon_instance: String,
+    #[serde(default)]
+    daemon_pid: u32,
+}
+
+fn read_active_task(path: &Path) -> Result<Option<ActiveCodexTask>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("active Codex task state is invalid")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+fn write_active_task(path: &Path, task: &ActiveCodexTask) -> Result<()> {
+    let parent = path.parent().context("active task path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!("active-codex-task-{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, serde_json::to_vec(task)?)?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+fn claim_active_task(path: &Path, task_id: &str, daemon_instance: &str) -> Result<ActiveCodexTask> {
+    if let Some(active) = read_active_task(path)? {
+        bail!("device already has active Codex task {}", active.task_id)
+    }
+    let lock_path = active_task_lock_path(path);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("device already has an active Codex task")
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let state = ActiveCodexTask {
+        task_id: task_id.into(),
+        daemon_instance: daemon_instance.into(),
+        daemon_pid: std::process::id(),
+    };
+    if let Err(error) = write_active_task(path, &state) {
+        let _ = fs::remove_file(lock_path);
+        return Err(error);
+    }
+    Ok(state)
+}
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, WaitForSingleObject},
+    };
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    result == WAIT_TIMEOUT
+}
+#[cfg(not(windows))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+fn clear_instance_active_task(path: &Path, daemon_instance: &str) -> Result<()> {
+    if let Some(active) = read_active_task(path)? {
+        if active.daemon_instance == daemon_instance {
+            clear_active_task(path, &active.task_id)?;
+        }
+    }
+    Ok(())
+}
+fn is_terminal_turn_event(method: &str) -> bool {
+    matches!(
+        method,
+        "turn/completed" | "turn/failed" | "turn/cancelled" | "turn/canceled"
+    )
+}
+fn clear_active_task(path: &Path, task_id: &str) -> Result<()> {
+    if read_active_task(path)?.is_some_and(|active| active.task_id == task_id) {
+        fs::remove_file(path)?;
+        let lock_path = active_task_lock_path(path);
+        if lock_path.exists() {
+            fs::remove_file(lock_path)?;
+        }
+    }
+    Ok(())
 }
 fn secret_entry() -> Result<Entry> {
     Ok(Entry::new(SERVICE, "device-secret")?)
@@ -207,23 +327,88 @@ fn codex_websocket_url(server: &str) -> Result<String> {
     }
 }
 
+fn http_server_url(server: &str) -> Result<String> {
+    let value = server.trim_end_matches('/');
+    if let Some(rest) = value.strip_prefix("wss://") {
+        return Ok(format!("https://{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix("ws://localhost") {
+        return Ok(format!("http://localhost{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix("ws://127.0.0.1") {
+        return Ok(format!("http://127.0.0.1{rest}"));
+    }
+    if value.starts_with("https://")
+        || value.starts_with("http://localhost")
+        || value.starts_with("http://127.0.0.1")
+    {
+        return Ok(value.into());
+    }
+    bail!("server must use HTTPS or localhost HTTP")
+}
+
+async fn model_token() -> Result<()> {
+    let (config, credential) = load_config()?;
+    let active = read_active_task(&active_task_path()?)?.context("no active Codex task")?;
+    let response = reqwest::Client::new()
+        .post(format!("{}/model-tokens", http_server_url(&config.server)?))
+        .header("X-Device-ID", &config.device_id)
+        .bearer_auth(credential)
+        .json(&serde_json::json!({"task_id":active.task_id,"model":"deepseek-v4-flash"}))
+        .send()
+        .await
+        .context("model token request failed")?;
+    if !response.status().is_success() {
+        bail!("model token request was rejected ({})", response.status())
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("invalid model token response")?;
+    let token = body["access_token"]
+        .as_str()
+        .context("model token response omitted access_token")?;
+    print!("{token}");
+    Ok(())
+}
+
 async fn run_codex(config: Config, credential: String, settings: CodexSettings) -> Result<()> {
+    let data_dir = agent_data_dir()?;
+    let current_exe = fs::canonicalize(std::env::current_exe()?)?;
     let runtime = codex_bridge::RuntimeConfig {
         executable: settings.executable,
         expected_version: settings.expected_version,
         expected_sha256: settings.expected_sha256,
         request_timeout: Duration::from_secs(settings.request_timeout_seconds.clamp(1, 300)),
+        codex_home: data_dir.join("codex-home"),
+        responses_base_url: format!("{}/v1", http_server_url(&config.server)?),
+        auth_command: current_exe,
     };
+    let daemon_instance = uuid::Uuid::new_v4().to_string();
+    let active_path = active_task_path()?;
+    // A fresh daemon instance never inherits a previous process's task lease.
+    if let Some(stale) = read_active_task(&active_path)? {
+        if process_is_alive(stale.daemon_pid) {
+            bail!("another company-agent process owns the active Codex task lease")
+        }
+        clear_active_task(&active_path, &stale.task_id)?;
+    }
     let mut retry = Duration::from_secs(1);
+    let mut outbox = BTreeMap::new();
     loop {
         match codex_bridge::CodexAppServer::start(runtime.clone()).await {
             Ok(mut bridge) => {
                 retry = Duration::from_secs(1);
                 let mut book = codex_bridge::DispatchBook::default();
-                let mut outbox = BTreeMap::new();
-                while let Err(error) =
-                    run_codex_connection(&config, &credential, &mut bridge, &mut book, &mut outbox)
-                        .await
+                while let Err(error) = run_codex_connection(
+                    &config,
+                    &credential,
+                    &daemon_instance,
+                    &mut bridge,
+                    &mut book,
+                    &mut outbox,
+                )
+                .await
                 {
                     eprintln!("Codex device connection closed: {error:#}");
                     if !bridge.is_running().await.unwrap_or(false) {
@@ -232,6 +417,7 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 let _ = bridge.shutdown().await;
+                clear_instance_active_task(&active_path, &daemon_instance)?;
             }
             Err(error) => eprintln!("Codex App Server failed to start: {error:#}"),
         }
@@ -251,13 +437,33 @@ where
     Ok(())
 }
 
+async fn send_audit_event<S>(
+    write: &mut S,
+    outbox: &mut BTreeMap<String, serde_json::Value>,
+    task_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let source_event_id = format!("agent:{}", uuid::Uuid::new_v4());
+    let event = serde_json::json!({"type":"task.event","task_id":task_id,"source_event_id":source_event_id,"event_type":event_type,"payload":payload});
+    outbox.insert(source_event_id, event.clone());
+    send_json(write, event).await
+}
+
 async fn run_codex_connection(
     config: &Config,
     credential: &str,
+    daemon_instance: &str,
     bridge: &mut codex_bridge::CodexAppServer,
     book: &mut codex_bridge::DispatchBook,
     outbox: &mut BTreeMap<String, serde_json::Value>,
 ) -> Result<()> {
+    let active_path = active_task_path()?;
+    let backups = backup::BackupStore::new(agent_data_dir()?.join("task-backups"))?;
     let url = codex_websocket_url(&config.server)?;
     let (socket, _) = connect_async(&url).await?;
     let (mut write, mut read) = socket.split();
@@ -292,7 +498,7 @@ async fn run_codex_connection(
                 let notification = notification.context("Codex notification stream closed")?;
                 let thread_id = notification.params.get("threadId").and_then(serde_json::Value::as_str).unwrap_or("");
                 let turn_id = notification.params.get("turnId").and_then(serde_json::Value::as_str).unwrap_or("");
-                let Some(task_id) = book.task_for_event(thread_id, turn_id) else { continue };
+                let Some(task_id) = book.task_for_event(thread_id, turn_id).map(str::to_owned) else { continue };
                 let source_event_id = notification.source_event_id.clone();
                 let event = serde_json::json!({
                     "type":"task.event",
@@ -303,6 +509,14 @@ async fn run_codex_connection(
                 });
                 outbox.insert(source_event_id, event.clone());
                 send_json(&mut write, event).await?;
+                if is_terminal_turn_event(&notification.method) {
+                    clear_active_task(&active_path, &task_id)?;
+                    book.remove(&task_id);
+                    // Command-auth tokens are cached per provider. Restarting the pinned
+                    // App Server at each task boundary guarantees no task reuses one.
+                    bridge.shutdown().await?;
+                    bail!("Codex task reached terminal state; rotating task-bound model authentication")
+                }
             }
             request = bridge.server_requests.recv() => {
                 let request = request.context("Codex server request stream closed")?;
@@ -341,8 +555,18 @@ async fn run_codex_connection(
                             let root_id = value["root_id"].as_str().context("dispatch missing root_id")?;
                             let prompt = value["prompt"].as_str().context("dispatch missing prompt")?;
                             let canonical = authorized_root(config, root_id)?;
-                            let thread_id = bridge.start_thread(&canonical).await?;
-                            let turn_id = bridge.start_turn(&thread_id, &canonical, prompt).await?;
+                            claim_active_task(&active_path, task_id, daemon_instance)?;
+                            let thread_id = match bridge.start_thread(&canonical).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; return Err(error); } };
+                            let manifest = match backups.create(task_id, root_id, &canonical) {
+                                Ok(manifest) => manifest,
+                                Err(error) => {
+                                    clear_active_task(&active_path, task_id)?;
+                                    send_audit_event(&mut write, outbox, task_id, "backup.failed", serde_json::json!({"root_id":root_id,"error":error.to_string()})).await?;
+                                    bail!("task backup failed before turn start: {error:#}")
+                                }
+                            };
+                            send_audit_event(&mut write, outbox, task_id, "backup.created", serde_json::json!({"root_id":root_id,"files":manifest.entries.iter().filter(|entry| entry.kind == backup::EntryKind::File).count(),"snapshot_retention":"retained_until_explicit_cleanup"})).await?;
+                            let turn_id = match bridge.start_turn(&thread_id, &canonical, prompt).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; return Err(error); } };
                             book.register(task_id.to_owned(), thread_id, turn_id);
                         }
                         send_json(&mut write, serde_json::json!({"type":"task.dispatch.ack","task_id":task_id,"delivery_id":delivery_id})).await?;
@@ -350,14 +574,54 @@ async fn run_codex_connection(
                     "task.cancel" => {
                         let task_id = value["task_id"].as_str().context("cancel missing task_id")?;
                         if let Some((thread_id, turn_id)) = book.interrupt_params(task_id) { bridge.interrupt(thread_id, turn_id).await?; }
+                        clear_active_task(&active_path, task_id)?;
+                        book.remove(task_id);
+                        bridge.shutdown().await?;
+                        bail!("Codex task was cancelled; rotating task-bound model authentication")
+                    }
+                    "task.rollback" => {
+                        let task_id = value["task_id"].as_str().context("rollback missing task_id")?;
+                        let root_id = value["root_id"].as_str().context("rollback missing root_id")?;
+                        let delivery_id = value["delivery_id"].as_str().context("rollback missing delivery_id")?;
+                        if let Some(active) = read_active_task(&active_path)? {
+                            send_audit_event(&mut write, outbox, task_id, "rollback.failed", serde_json::json!({"root_id":root_id,"error":format!("Codex task {} is still active", active.task_id)})).await?;
+                            send_json(&mut write, serde_json::json!({"type":"task.rollback.ack","task_id":task_id,"delivery_id":delivery_id,"status":"failed"})).await?;
+                            continue;
+                        }
+                        let canonical = match authorized_root(config, root_id) {
+                            Ok(root) => root,
+                            Err(error) => {
+                                send_audit_event(&mut write, outbox, task_id, "rollback.failed", serde_json::json!({"root_id":root_id,"error":error.to_string()})).await?;
+                                send_json(&mut write, serde_json::json!({"type":"task.rollback.ack","task_id":task_id,"delivery_id":delivery_id,"status":"failed"})).await?;
+                                continue;
+                            }
+                        };
+                        let rollback_status = match backups.rollback(task_id, root_id, &canonical) {
+                            Ok(manifest) => {
+                                send_audit_event(&mut write, outbox, task_id, "rollback.completed", serde_json::json!({"root_id":root_id,"entries":manifest.entries.len()})).await?;
+                                "succeeded"
+                            }
+                            Err(error) => {
+                                send_audit_event(&mut write, outbox, task_id, "rollback.failed", serde_json::json!({"root_id":root_id,"error":error.to_string()})).await?;
+                                "failed"
+                            }
+                        };
+                        send_json(&mut write, serde_json::json!({"type":"task.rollback.ack","task_id":task_id,"delivery_id":delivery_id,"status":rollback_status})).await?;
                     }
                     "approval.decision" => {
                         let request_id = value["request_id"].as_u64().context("approval decision missing request_id")?;
+                        let delivery_id = value["delivery_id"].as_str().context("approval decision missing delivery_id")?;
                         if value["approved"].as_bool().unwrap_or(false) {
                             bridge.respond(request_id, Ok(value.get("result").cloned().unwrap_or_else(|| serde_json::json!({"decision":"accept"})))).await?;
                         } else {
                             bridge.respond(request_id, Ok(value.get("result").cloned().unwrap_or_else(|| serde_json::json!({"decision":"decline"})))).await?;
                         }
+                        send_json(&mut write, serde_json::json!({
+                            "type":"approval.decision.ack",
+                            "approval_id":value["approval_id"],
+                            "task_id":value["task_id"],
+                            "delivery_id":delivery_id,
+                        })).await?;
                     }
                     _ => {}
                 }
@@ -593,6 +857,9 @@ fn configure_codex(executable: PathBuf, sha256: Option<String>) -> Result<()> {
         expected_version: settings.expected_version.clone(),
         expected_sha256: settings.expected_sha256.clone(),
         request_timeout: Duration::from_secs(settings.request_timeout_seconds),
+        codex_home: agent_data_dir()?.join("codex-home"),
+        responses_base_url: format!("{}/v1", http_server_url(&config.server)?),
+        auth_command: fs::canonicalize(std::env::current_exe()?)?,
     }
     .validate()?;
     config.codex = Some(settings);
@@ -618,6 +885,7 @@ async fn main() -> Result<()> {
         Command::Status => status(),
         Command::ConfigureCodex { executable, sha256 } => configure_codex(executable, sha256),
         Command::UseLegacy => use_legacy(),
+        Command::ModelToken => model_token().await,
     }
 }
 
@@ -684,5 +952,51 @@ mod tests {
         assert_eq!(authorized_root(&config, "allowed").unwrap(), canonical);
         assert!(authorized_root(&config, "other").is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_codex_task_is_exclusive_and_cleared_by_owner() {
+        let dir = std::env::temp_dir().join(format!("agent-active-task-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active.json");
+        assert_eq!(
+            claim_active_task(&path, "task-1", "daemon-1")
+                .unwrap()
+                .task_id,
+            "task-1"
+        );
+        assert!(claim_active_task(&path, "task-2", "daemon-1").is_err());
+        clear_active_task(&path, "task-2").unwrap();
+        assert_eq!(read_active_task(&path).unwrap().unwrap().task_id, "task-1");
+        clear_active_task(&path, "task-1").unwrap();
+        assert!(read_active_task(&path).unwrap().is_none());
+        assert!(!active_task_lock_path(&path).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn converts_only_allowed_server_urls_for_http() {
+        assert_eq!(
+            http_server_url("wss://agent.example").unwrap(),
+            "https://agent.example"
+        );
+        assert_eq!(
+            http_server_url("ws://localhost:8000").unwrap(),
+            "http://localhost:8000"
+        );
+        assert!(http_server_url("http://agent.example").is_err());
+    }
+
+    #[test]
+    fn all_turn_terminal_events_rotate_the_app_server() {
+        for method in [
+            "turn/completed",
+            "turn/failed",
+            "turn/cancelled",
+            "turn/canceled",
+        ] {
+            assert!(is_terminal_turn_event(method));
+        }
+        assert!(!is_terminal_turn_event("item/agentMessage/delta"));
     }
 }

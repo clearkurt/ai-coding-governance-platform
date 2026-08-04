@@ -7,8 +7,8 @@ describe("task store", () => {
 
   it("deduplicates persisted task event sequences", () => {
     const task = useTaskStore();
-    task.apply({ sequence: 1, type: "approval.requested", payload: {} });
-    task.apply({ sequence: 1, type: "approval.requested", payload: {} });
+    task.apply({ sequence: 1, type: "item/commandExecution/requestApproval", payload: {} });
+    task.apply({ sequence: 1, type: "item/commandExecution/requestApproval", payload: {} });
     expect(task.events).toHaveLength(1);
     expect(task.state).toBe("waiting_approval");
   });

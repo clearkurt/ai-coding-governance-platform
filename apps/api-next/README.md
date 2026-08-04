@@ -25,3 +25,9 @@ The first Alembic revision creates the target control-plane schema. It intention
 `POST /auth/login` creates a secure HttpOnly session cookie after checking a scrypt password hash. `POST /auth/logout` revokes that token server-side as well as clearing the cookie. Devices authenticate as the first message on `WSS /ws/devices`; their credentials are stored and checked only as hashes, with expiry and revocation checks.
 
 `POST /tasks` is idempotent per team, device and idempotency key. A connected target device receives a `task.dispatch` with a durable `delivery_id`; reconnecting devices are redelivered pending/running tasks and acknowledge delivery with `task.dispatch.ack`. Device events are assigned an authoritative persisted sequence and deduplicated by `source_event_id`. Browsers resume `GET /tasks/{id}/events` with `Last-Event-ID`; the default stream follows later persisted events. `?follow=false` is available for bounded replay clients and tests.
+
+`POST /model-tokens` exchanges a valid device credential for a short-lived task-bound token. `POST /v1/responses` validates that token, enforces the selected model, concurrency and daily team quota, then transparently forwards raw streaming or non-streaming Responses API traffic to DeepSeek. The upstream key is never returned to the device.
+
+Approval decisions and rollback requests use stable delivery identifiers, replay after device reconnect, and remain pending until the device ACKs them. `GET /tasks/{id}/audit` exposes task-scoped audit metadata to an authorized project member. `POST /tasks/{id}/rollback` is available only for terminal tasks and asks the local daemon to restore its retained pre-turn snapshot.
+
+For local HTTP development set `COMPANY_AGENT_SESSION_COOKIE_SECURE=false`. Production must use HTTPS/WSS and leave secure cookies enabled.

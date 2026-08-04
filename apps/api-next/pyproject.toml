@@ -30,3 +30,7 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.ruff.lint]
+# FastAPI intentionally declares dependency providers in signature defaults.
+ignore = ["B008"]

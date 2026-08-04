@@ -1,10 +1,23 @@
 from app.db.models import Base, Task, TaskEvent
 
-
 EXPECTED_TABLES = {
-    "teams", "users", "sessions", "devices", "device_credentials", "projects", "project_grants",
-    "conversations", "codex_threads", "turns", "tasks", "task_events", "approval_requests",
-    "model_tokens", "model_usage", "audit_events", "runtime_releases",
+    "teams",
+    "users",
+    "sessions",
+    "devices",
+    "device_credentials",
+    "projects",
+    "project_grants",
+    "conversations",
+    "codex_threads",
+    "turns",
+    "tasks",
+    "task_events",
+    "approval_requests",
+    "model_tokens",
+    "model_usage",
+    "audit_events",
+    "runtime_releases",
 }
 
 
@@ -28,6 +41,12 @@ def test_task_turn_foreign_key_does_not_null_the_team_scope() -> None:
 
 
 def test_sensitive_columns_store_only_hashes() -> None:
-    for table_name, column_name in (("sessions", "token_hash"), ("device_credentials", "credential_hash"), ("model_tokens", "token_hash")):
+    for table_name, column_name in (
+        ("sessions", "token_hash"),
+        ("device_credentials", "credential_hash"),
+        ("model_tokens", "token_hash"),
+    ):
         assert column_name in Base.metadata.tables[table_name].columns
-        assert "token" not in {column.name for column in Base.metadata.tables[table_name].columns if column.name != "token_hash"}
+        assert "token" not in {
+            column.name for column in Base.metadata.tables[table_name].columns if column.name != "token_hash"
+        }

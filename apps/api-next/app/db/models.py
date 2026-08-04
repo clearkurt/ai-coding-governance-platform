@@ -4,7 +4,20 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import Uuid
 
@@ -42,7 +55,10 @@ class Team(IdTimestampMixin, Base):
 
 class User(IdTimestampMixin, TeamScopedMixin, Base):
     __tablename__ = "users"
-    __table_args__ = (UniqueConstraint("id", "team_id", name="uq_users_id_team"), UniqueConstraint("team_id", "email", name="uq_users_team_email"))
+    __table_args__ = (
+        UniqueConstraint("id", "team_id", name="uq_users_id_team"),
+        UniqueConstraint("team_id", "email", name="uq_users_team_email"),
+    )
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     password_hash: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="member")
@@ -64,7 +80,10 @@ class Session(IdTimestampMixin, TeamScopedMixin, Base):
 
 class Device(IdTimestampMixin, TeamScopedMixin, Base):
     __tablename__ = "devices"
-    __table_args__ = (UniqueConstraint("id", "team_id", name="uq_devices_id_team"), UniqueConstraint("team_id", "machine_id", name="uq_devices_team_machine"))
+    __table_args__ = (
+        UniqueConstraint("id", "team_id", name="uq_devices_id_team"),
+        UniqueConstraint("team_id", "machine_id", name="uq_devices_team_machine"),
+    )
     machine_id: Mapped[str] = mapped_column(String(128), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     runtime_version: Mapped[str | None] = mapped_column(String(80))
@@ -122,7 +141,9 @@ class Conversation(IdTimestampMixin, TeamScopedMixin, Base):
 class CodexThread(IdTimestampMixin, TeamScopedMixin, Base):
     __tablename__ = "codex_threads"
     __table_args__ = (
-        ForeignKeyConstraint(["conversation_id", "team_id"], ["conversations.id", "conversations.team_id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["conversation_id", "team_id"], ["conversations.id", "conversations.team_id"], ondelete="CASCADE"
+        ),
         UniqueConstraint("conversation_id", name="uq_codex_threads_conversation"),
         UniqueConstraint("provider_thread_id", name="uq_codex_threads_provider_id"),
         UniqueConstraint("id", "team_id", name="uq_codex_threads_id_team"),
@@ -134,7 +155,9 @@ class CodexThread(IdTimestampMixin, TeamScopedMixin, Base):
 class Turn(IdTimestampMixin, TeamScopedMixin, Base):
     __tablename__ = "turns"
     __table_args__ = (
-        ForeignKeyConstraint(["thread_id", "team_id"], ["codex_threads.id", "codex_threads.team_id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["thread_id", "team_id"], ["codex_threads.id", "codex_threads.team_id"], ondelete="CASCADE"
+        ),
         UniqueConstraint("thread_id", "sequence", name="uq_turns_thread_sequence"),
         UniqueConstraint("id", "team_id", name="uq_turns_id_team"),
     )
@@ -149,7 +172,9 @@ class Task(IdTimestampMixin, TeamScopedMixin, Base):
     __table_args__ = (
         ForeignKeyConstraint(["device_id", "team_id"], ["devices.id", "devices.team_id"], ondelete="RESTRICT"),
         ForeignKeyConstraint(["project_id", "team_id"], ["projects.id", "projects.team_id"], ondelete="RESTRICT"),
-        ForeignKeyConstraint(["conversation_id", "team_id"], ["conversations.id", "conversations.team_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["conversation_id", "team_id"], ["conversations.id", "conversations.team_id"], ondelete="RESTRICT"
+        ),
         ForeignKeyConstraint(["turn_id", "team_id"], ["turns.id", "turns.team_id"], ondelete="RESTRICT"),
         UniqueConstraint("id", "team_id", name="uq_tasks_id_team"),
         UniqueConstraint("team_id", "device_id", "idempotency_key", name="uq_tasks_team_device_idempotency"),
@@ -163,7 +188,13 @@ class Task(IdTimestampMixin, TeamScopedMixin, Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     delivery_id: Mapped[str] = mapped_column(String(128), nullable=False, default=lambda: str(uuid.uuid4()))
     delivery_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.pending)
+    rollback_delivery_id: Mapped[str | None] = mapped_column(String(128))
+    rollback_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rollback_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rollback_status: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[TaskStatus] = mapped_column(
+        Enum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.pending
+    )
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -193,6 +224,8 @@ class ApprovalRequest(IdTimestampMixin, TeamScopedMixin, Base):
     provider_item_id: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decision_delivery_id: Mapped[str | None] = mapped_column(String(128))
+    decision_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ModelToken(IdTimestampMixin, TeamScopedMixin, Base):

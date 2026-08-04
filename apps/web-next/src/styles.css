@@ -1,3 +1,20 @@
-:root { color: #18212f; background: #f5f7fa; font-family: Inter, "Microsoft YaHei", sans-serif; }
+:root { color: #18212f; background: #f3f5f8; font-family: Inter, "Microsoft YaHei", sans-serif; }
 body { margin: 0; }
-.workspace { max-width: 960px; margin: 48px auto; padding: 0 24px; }
+.app-layout { min-height: 100vh; }
+.topbar { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; background: #fff; }
+.topbar > div, .topbar-user { display: flex; align-items: center; gap: 14px; }
+.muted { color: #8b95a5; font-size: 12px; }
+.workspace { max-width: 1280px; width: calc(100% - 40px); margin: 24px auto; }
+.task-grid { display: grid; grid-template-columns: minmax(320px, 0.8fr) minmax(420px, 1.2fr); gap: 18px; align-items: start; }
+.status-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.status-row code { color: #667085; font-size: 12px; overflow-wrap: anywhere; }
+.form-alert { margin-bottom: 14px; }
+.cancel-button { margin-left: 10px; }
+.approval-actions { display: flex; gap: 8px; margin-top: 8px; }
+.approval-panel { border: 1px solid #f0c36a; background: #fff9e8; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+.approval-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.approval-row code { flex: 1; overflow-wrap: anywhere; }
+pre { margin: 8px 0 0; padding: 10px; border-radius: 6px; overflow: auto; background: #f6f7f9; font-size: 12px; white-space: pre-wrap; }
+.login-shell { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+.login-card { width: min(420px, 100%); }
+@media (max-width: 820px) { .task-grid { grid-template-columns: 1fr; } .topbar { padding: 0 14px; } .workspace { width: calc(100% - 24px); margin: 12px auto; } }

@@ -17,7 +17,9 @@ async def get_store(session: AsyncSession = Depends(get_session)) -> AsyncIterat
     yield PostgresStore(session)
 
 
-async def current_user(store: Store = Depends(get_store), company_session: str | None = Cookie(default=None)) -> UserIdentity:
+async def current_user(
+    store: Store = Depends(get_store), company_session: str | None = Cookie(default=None)
+) -> UserIdentity:
     if not company_session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
     user = await store.session_user(company_session)
