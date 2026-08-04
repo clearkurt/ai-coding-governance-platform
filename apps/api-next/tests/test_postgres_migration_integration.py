@@ -10,6 +10,7 @@ import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import quote, unquote, urlencode
 
 import pytest
 from alembic.config import Config
@@ -58,8 +59,9 @@ def _postgres_tool(name: str) -> list[str] | None:
 
 
 def _tool_major(command: list[str]) -> int:
-    result = subprocess.run([*command, "--version"], capture_output=True, text=True, check=True, timeout=15)
-    match = re.search(r"PostgreSQL\)\s+(\d+)", result.stdout)
+    result = subprocess.run([*command, "--version"], capture_output=True, check=True, timeout=15)
+    output = result.stdout.decode("utf-8", errors="replace")
+    match = re.search(r"PostgreSQL\)\s+(\d+)", output)
     if not match:
         raise ValueError(f"cannot parse PostgreSQL tool version from {command[-1]}")
     return int(match.group(1))
@@ -67,7 +69,17 @@ def _tool_major(command: list[str]) -> int:
 
 def _credential_free_url_and_password(url: str) -> tuple[str, str]:
     parsed = make_url(url)
-    return parsed.set(password=None).render_as_string(hide_password=False), parsed.password or ""
+    username = quote(parsed.username or "", safe="")
+    host = parsed.host or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    authority = f"{username}@{host}" if username else host
+    if parsed.port is not None:
+        authority = f"{authority}:{parsed.port}"
+    database = f"/{quote(unquote(parsed.database), safe='')}" if parsed.database else ""
+    query = f"?{urlencode(parsed.query, doseq=True)}" if parsed.query else ""
+    cli_url = f"postgresql://{authority}{database}{query}"
+    return cli_url, parsed.password or ""
 
 
 def test_postgres_identifier_quoting_escapes_role_names() -> None:
@@ -88,6 +100,26 @@ def test_postgres_tool_prefix_rejects_invalid_json_argv(monkeypatch: pytest.Monk
 
     with pytest.raises(ValueError, match="JSON string array"):
         _postgres_tool("pg_dump")
+
+
+def test_postgres_cli_url_removes_async_driver_and_password() -> None:
+    cli_url, password = _credential_free_url_and_password(
+        "postgresql+asyncpg://test%20user:p%40ss%3Aword@127.0.0.1:5432/control%20plane?sslmode=disable"
+    )
+
+    assert cli_url == "postgresql://test%20user@127.0.0.1:5432/control%20plane?sslmode=disable"
+    assert password == "p@ss:word"
+    assert password not in cli_url
+    assert "asyncpg" not in cli_url
+
+
+def test_postgres_tool_version_decodes_non_locale_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=b"pg_dump (PostgreSQL) 16.14\xff\xfe", stderr=b"\x81")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _tool_major(["wsl", "--", "pg_dump"]) == 16
 
 
 @pytest.fixture
