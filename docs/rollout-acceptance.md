@@ -8,7 +8,7 @@
 
 | 范围 | 结果 |
 |---|---|
-| FastAPI | 普通 `pytest` 93 项通过、8 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle、同进程 localhost WebSocket reconnect、uvicorn 子进程重启、custom-format backup/restore、localhost TLS/WSS、灰度回滚恢复与只读灰度报告 integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
+| FastAPI | 普通 `pytest` 93 项通过、9 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle、同进程 localhost WebSocket reconnect、uvicorn 子进程重启、custom-format backup/restore、localhost TLS/WSS、灰度回滚恢复、只读灰度报告与真实网络 TLS Responses proxy integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
 | Rust daemon | `cargo test` 52 项通过，3 项真实 artifact integration 默认 ignored；初始化、localhost Responses 审批/同步/回滚与取消 integration 均已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
@@ -30,6 +30,7 @@ Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable
 - localhost TLS/WSS integration 已显式运行通过：客户端信任一次性测试 CA 时可完成设备认证、delivery 重放及 ACK；未知 CA 和可信 CA 下的主机名不匹配均在保持证书校验启用时握手失败。它只证明直连 uvicorn 的本地 TLS 契约，不代表生产反向代理、证书签发/轮换、TLS 策略或真实网络路径。
 - 生产任务入口现默认 `disabled`，支持设备 UUID allowlist 和显式高风险 `all`。真实 PostgreSQL integration 已验证创建 pending task 后切回 `disabled`，用全新 session/store 仍重放相同 task/delivery；该开关只阻止新任务，不阻断在途恢复。真实设备分批灰度及观察窗口仍未完成。
 - 只读灰度报告已在真实 PostgreSQL 上验证全局与团队过滤、任务终态比例、stale 活动任务、三类未确认 delivery、失败审计、模型用量、事件序列缺口和缺少终态事件的终态任务，并确认敏感 canary 不进入 JSON。发布阈值、观察窗口和实际处置仍须在生产变更单中批准。
+- 真实网络 TLS Responses proxy integration 已显式运行通过：独立 uvicorn 中央 API 通过临时受信 CA 连接 HTTPS 上游，注入仅服务端持有的 provider key，透明转发完整 SSE，并在 PostgreSQL 中只记录一次用量；缺失、过期和终态撤销的任务令牌均在中央拒绝且不上游。该测试证明网络代理边界，不证明真实 DeepSeek 协议行为或模型质量。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
 - 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端 DeepSeek 模型任务。真实 artifact 安装、初始化，以及 localhost Responses stub 下的审批、取消、同步和回滚机械闭环均已通过，但 stub 不证明 DeepSeek 行为、模型质量或中央代理到真实 DeepSeek 的完整企业任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。
