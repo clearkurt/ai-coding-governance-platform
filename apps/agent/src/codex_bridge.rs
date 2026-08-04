@@ -1147,6 +1147,7 @@ fn main() {
             server.interrupt(&thread, &turn).await?;
             let terminal = tokio::time::timeout(Duration::from_secs(15), async { loop { tokio::select! { Some(notification)=server.notifications.recv()=> if notification.method=="turn/completed" { break notification.params }, Some(request)=server.server_requests.recv()=>panic!("unexpected approval during cancel: {}",request.method), else=>panic!("Codex streams closed before cancelled terminal") } } }).await?;
             assert_eq!(terminal["turn"]["status"], "interrupted");
+            server.shutdown().await?;
             let upstream_closed = tokio::time::timeout(Duration::from_secs(12), closed_rx).await??;
             assert!(upstream_closed, "pinned Codex left the upstream Responses stream open after interrupted terminal");
             anyhow::Ok(())
@@ -1165,7 +1166,7 @@ fn main() {
                 .count(),
             1
         );
-        server.shutdown().await.unwrap();
+        let _ = server.shutdown().await;
         stub.await.unwrap();
         let _ = fs::remove_dir_all(&base);
         result.unwrap();

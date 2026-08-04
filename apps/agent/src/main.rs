@@ -202,6 +202,16 @@ fn is_terminal_turn_event(method: &str) -> bool {
         "turn/completed" | "turn/failed" | "turn/cancelled" | "turn/canceled"
     )
 }
+
+fn should_sync_completed_turn(method: &str, params: &serde_json::Value) -> bool {
+    method == "turn/completed"
+        && !matches!(
+            params
+                .pointer("/turn/status")
+                .and_then(serde_json::Value::as_str),
+            Some("interrupted" | "cancelled" | "canceled")
+        )
+}
 fn clear_active_task(path: &Path, task_id: &str) -> Result<()> {
     if read_active_task(path)?.is_some_and(|active| active.task_id == task_id) {
         fs::remove_file(path)?;
@@ -558,9 +568,10 @@ async fn run_codex_connection(
                 let Some(task_id) = book.task_for_event(thread_id, turn_id).map(str::to_owned) else { continue };
                 let Some(shadow) = workspaces.get(&task_id) else { continue };
                 let mut event_type = notification.method.clone();
+                let sync_completed = should_sync_completed_turn(&notification.method, &notification.params);
                 let mut payload = workspace::sanitize_event(notification.params, &shadow.path, shadow.real_root());
                 let mut sync_audit = None;
-                if notification.method == "turn/completed" {
+                if sync_completed {
                     match shadow.sync_back(shadow.real_root()) {
                         Ok(()) => sync_audit = Some(("workspace.sync.completed", serde_json::json!({"status":"completed"}))),
                         Err(error) => {
@@ -655,11 +666,10 @@ async fn run_codex_connection(
                     "task.cancel" => {
                         let task_id = value["task_id"].as_str().context("cancel missing task_id")?;
                         if let Some((thread_id, turn_id)) = book.interrupt_params(task_id) { bridge.interrupt(thread_id, turn_id).await?; }
-                        clear_active_task(&active_path, task_id)?;
-                        book.remove(task_id);
-                        if let Some(shadow)=workspaces.remove(task_id){let _=shadow.remove();}
-                        bridge.shutdown().await?;
-                        bail!("Codex task was cancelled; rotating task-bound model authentication")
+                        // Keep the single active-task lease until the strict interrupted
+                        // terminal arrives. The terminal path persists that event first,
+                        // skips shadow sync, then kills the task-bound App Server so its
+                        // upstream Responses stream cannot survive cancellation.
                     }
                     "task.rollback" => {
                         let task_id = value["task_id"].as_str().context("rollback missing task_id")?;
@@ -1218,5 +1228,23 @@ mod tests {
             assert!(is_terminal_turn_event(method));
         }
         assert!(!is_terminal_turn_event("item/agentMessage/delta"));
+    }
+
+    #[test]
+    fn interrupted_terminal_skips_sync_and_keeps_terminal_precedence() {
+        assert!(should_sync_completed_turn(
+            "turn/completed",
+            &json!({"turn":{"status":"completed"}})
+        ));
+        for status in ["interrupted", "cancelled", "canceled"] {
+            assert!(!should_sync_completed_turn(
+                "turn/completed",
+                &json!({"turn":{"status":status}})
+            ));
+        }
+        assert!(!should_sync_completed_turn(
+            "turn/failed",
+            &json!({"turn":{"status":"failed"}})
+        ));
     }
 }
