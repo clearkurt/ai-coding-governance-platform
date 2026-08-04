@@ -35,4 +35,14 @@ Approval decisions and rollback requests use stable delivery identifiers, replay
 
 For local HTTP development set `COMPANY_AGENT_SESSION_COOKIE_SECURE=false`. Production must use HTTPS/WSS and leave secure cookies enabled.
 
-The current acceptance baseline is 23 passing pytest tests and a clean Ruff check. Real PostgreSQL upgrade/downgrade, real DeepSeek Responses traffic, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
+The current acceptance baseline is 24 passing regular pytest tests, one environment-gated PostgreSQL integration test, and a clean Ruff check. The PostgreSQL integration has been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
+
+To repeat the destructive migration check safely, supply an administrative URL for an existing PostgreSQL instance. The test creates a random dedicated login/database, runs upgrade/downgrade/re-upgrade only there, terminates its own remaining connections, and removes both objects in `finally`. It never prints or stores the password:
+
+```powershell
+$env:COMPANY_AGENT_TEST_POSTGRES_ADMIN_URL = "postgresql://admin:<password>@127.0.0.1:5432/postgres"
+pytest -m integration -q
+Remove-Item Env:COMPANY_AGENT_TEST_POSTGRES_ADMIN_URL
+```
+
+Without the variable, the integration test is skipped. Use a disposable PostgreSQL instance or a test administrator with `CREATEDB` and `CREATEROLE`; superuser is not required. The test temporarily grants its randomly created child role to that administrator so PostgreSQL permits `CREATE DATABASE ... OWNER`, then revokes the membership during cleanup. Never point application credentials at this test.

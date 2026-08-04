@@ -26,6 +26,7 @@ dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["integration: requires explicitly supplied disposable external infrastructure"]
 
 [tool.ruff]
 line-length = 120
