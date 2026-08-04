@@ -37,7 +37,7 @@ For local HTTP development set `COMPANY_AGENT_SESSION_COOKIE_SECURE=false`. Prod
 
 ## Production configuration preflight
 
-Production configuration is fail-closed at settings construction and therefore at API startup. With `COMPANY_AGENT_ENVIRONMENT=production`, the API requires PostgreSQL, secure session cookies, an HTTPS DeepSeek origin without embedded credentials, and a non-placeholder DeepSeek API key of at least 32 characters. `development` and `test` may explicitly use localhost HTTP and insecure cookies; selecting those environments is the exception and production never silently downgrades to them.
+Production configuration is fail-closed at settings construction and therefore at API startup. With `COMPANY_AGENT_ENVIRONMENT=production`, the API requires PostgreSQL, secure session cookies, an HTTPS DeepSeek origin without credentials, path, query or fragment, and a trimmed, control-character-free, non-placeholder DeepSeek API key of at least 32 characters. Request size, upstream timeout, concurrency, token TTL and daily quota have bounded positive ranges, and log level is normalized to a standard level. `development` and `test` may explicitly use localhost HTTP and insecure cookies; selecting those environments is the exception and production never silently downgrades to them.
 
 Run the offline preflight before migrations or process startup:
 
@@ -51,7 +51,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8081
 
 The preflight performs no network or database connection. It prints only field-level validation reasons and never configuration values or secrets. `/health/live` remains a process liveness check; `/health/ready` performs only `SELECT 1` and returns the fixed `database unavailable` detail on failure, without exposing connection strings or driver errors. Deployment orchestration should keep the instance out of service until both the preflight and readiness probe succeed.
 
-The current acceptance baseline is 55 passing regular pytest tests, six environment-gated PostgreSQL integration tests, and a clean Ruff check. The migration lifecycle, real `PostgresStore` lifecycle, same-process localhost WebSocket reconnect, subprocess uvicorn restart, custom-format backup/restore, and localhost TLS/WSS certificate-validation integrations have all been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic, a production-matched database drill, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
+The current acceptance baseline is 72 passing regular pytest tests, six environment-gated PostgreSQL integration tests, and a clean Ruff check. The migration lifecycle, real `PostgresStore` lifecycle, same-process localhost WebSocket reconnect, subprocess uvicorn restart, custom-format backup/restore, and localhost TLS/WSS certificate-validation integrations have all been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic, a production-matched database drill, and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
 
 To repeat the destructive migration check safely, supply an administrative URL for an existing PostgreSQL instance. The test creates a random dedicated login/database, runs upgrade/downgrade/re-upgrade only there, terminates its own remaining connections, and removes both objects in `finally`. It never prints or stores the password:
 

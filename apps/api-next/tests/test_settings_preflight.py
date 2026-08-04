@@ -36,6 +36,58 @@ def test_production_settings_reject_insecure_configuration(override: dict[str, o
         Settings(**(VALID_PRODUCTION | override))
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        " " * 32,
+        " valid-production-secret-value-that-is-long-enough",
+        "valid-production-secret-value-that-is-long-enough\n",
+    ],
+)
+def test_production_settings_reject_whitespace_or_control_character_keys(key: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**(VALID_PRODUCTION | {"deepseek_api_key": key}))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.deepseek.com/v1",
+        "https://api.deepseek.com?region=test",
+        "https://api.deepseek.com#fragment",
+    ],
+)
+def test_production_settings_require_unambiguous_upstream_origin(url: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**(VALID_PRODUCTION | {"deepseek_base_url": url}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("responses_max_body_bytes", 0),
+        ("responses_max_body_bytes", 16 * 1024 * 1024 + 1),
+        ("responses_timeout_seconds", 0),
+        ("responses_timeout_seconds", 301),
+        ("responses_max_concurrency", 0),
+        ("responses_max_concurrency", 257),
+        ("model_token_ttl_seconds", 0),
+        ("model_token_ttl_seconds", 3601),
+        ("model_daily_token_quota_per_team", 0),
+        ("model_daily_token_quota_per_team", 1_000_000_001),
+    ],
+)
+def test_settings_reject_unsafe_resource_limits(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**(VALID_PRODUCTION | {field: value}))
+
+
+def test_log_level_is_normalized_and_restricted() -> None:
+    assert Settings(**(VALID_PRODUCTION | {"log_level": "warning"})).log_level == "WARNING"
+    with pytest.raises(ValidationError):
+        Settings(**(VALID_PRODUCTION | {"log_level": "verbose"}))
+
+
 def test_settings_reject_non_postgres_database() -> None:
     with pytest.raises(ValidationError):
         Settings(**(VALID_PRODUCTION | {"database_url": "sqlite:///agent.db"}))
