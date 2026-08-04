@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import socket
+import sys
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -366,6 +367,114 @@ def test_localhost_websocket_reconnect_replays_and_deduplicates(migrated_postgre
             await server_task
             app.dependency_overrides.pop(websocket_store, None)
             app.state.device_registry = old_registry
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_uvicorn_process_restart_replays_unacknowledged_delivery(migrated_postgres_url: str) -> None:
+    async def exercise() -> None:
+        import websockets
+
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            team = Team(slug=f"restart-{uuid.uuid4().hex}", name="Restart")
+            session.add(team)
+            await session.flush()
+            user = User(team_id=team.id, email="restart@example.test", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            team_id, user_email = team.id, user.email
+            await session.commit()
+            store = PostgresStore(session)
+            identity = await store.find_user(team_id, user_email)
+            await store.create_pairing_code(identity, "restart-pair", utcnow() + timedelta(minutes=5))
+            device, credential, projects = await store.consume_pairing_code(
+                "restart-pair", "restart-device", "restart-key", "runtime", ["Restart project"]
+            )
+            conversation = await store.create_conversation(identity, "Restart conversation")
+            task, _ = await store.create_task(
+                identity, device.id, projects[0].id, conversation.id, "restart-task", "prompt"
+            )
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        api_root = Path(__file__).parents[1]
+        environment = os.environ.copy()
+        environment["COMPANY_AGENT_DATABASE_URL"] = migrated_postgres_url
+
+        async def start_server():
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "app.main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--log-level",
+                "warning",
+                cwd=api_root,
+                env=environment,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            for _ in range(200):
+                if process.returncode is not None:
+                    raise RuntimeError("uvicorn child exited during startup")
+                try:
+                    _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.close()
+                    await writer.wait_closed()
+                    return process
+                except OSError:
+                    await asyncio.sleep(0.01)
+            process.terminate()
+            await process.wait()
+            raise TimeoutError("uvicorn child did not start")
+
+        async def stop_server(process):
+            if process.returncode is None:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=10)
+
+        uri = f"ws://127.0.0.1:{port}/ws/devices"
+        auth = {"type": "authenticate", "device_id": str(device.id), "credential": credential}
+        first_process = await start_server()
+        second_process = None
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                assert json.loads(await ws.recv())["type"] == "authenticated"
+                first_delivery = json.loads(await ws.recv())
+            await stop_server(first_process)
+
+            second_process = await start_server()
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps(auth))
+                assert json.loads(await ws.recv())["type"] == "authenticated"
+                replay = json.loads(await ws.recv())
+                assert replay["task_id"] == first_delivery["task_id"] == str(task.id)
+                assert replay["delivery_id"] == first_delivery["delivery_id"] == task.delivery_id
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "task.dispatch.ack",
+                            "task_id": str(task.id),
+                            "delivery_id": task.delivery_id,
+                        }
+                    )
+                )
+                assert json.loads(await ws.recv())["accepted"] is True
+        finally:
+            await stop_server(first_process)
+            if second_process:
+                await stop_server(second_process)
             await engine.dispose()
 
     asyncio.run(exercise())
