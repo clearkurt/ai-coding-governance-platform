@@ -10,9 +10,9 @@
 |---|---|
 | FastAPI | 普通 `pytest` 46 项通过、6 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle、同进程 localhost WebSocket reconnect、uvicorn 子进程重启、custom-format backup/restore 与 localhost TLS/WSS integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
-| Rust daemon | `cargo test` 51 项通过，2 项真实 artifact smoke 默认 ignored；初始化与 localhost Responses turn smoke 均已在本机显式运行通过 |
+| Rust daemon | `cargo test` 52 项通过，3 项真实 artifact integration 默认 ignored；初始化、localhost Responses 审批/同步/回滚与取消 integration 均已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
-| 本地 Responses 协议闭环 | 同一真实 Codex 已通过带认证的固定单模型 catalog、临时 command auth 和 localhost stub 完成固定文本 thread/turn；无审批且 workspace 未变化 |
+| 本地 Responses 协议闭环 | 同一真实 Codex 已通过带认证的固定单模型 catalog、临时 command auth 和 localhost stub 完成文本 turn、受控命令审批、tool-output continuation、影子同步、任务备份回滚与活动流取消；取消后 App Server 进程树轮换会关闭上游连接，下一次真实 turn 可用 |
 | 旧链路 | 根目录 legacy build 与 smoke test 通过 |
 | 依赖审计 | `npm audit` 0 个漏洞 |
 
@@ -29,7 +29,7 @@ Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable
 - uvicorn 子进程重启 integration 已在本机 PostgreSQL 16 显式运行通过：第一个真实 ASGI 进程在 dispatch ACK 前退出，第二个全新进程和连接注册表连接同一随机 PostgreSQL 数据库，并重放完全相同的 task/delivery 后成功 ACK。它只证明 localhost 进程边界恢复，不代表生产进程管理、TLS 或多实例协调。
 - localhost TLS/WSS integration 已显式运行通过：客户端信任一次性测试 CA 时可完成设备认证、delivery 重放及 ACK；未知 CA 和可信 CA 下的主机名不匹配均在保持证书校验启用时握手失败。它只证明直连 uvicorn 的本地 TLS 契约，不代表生产反向代理、证书签发/轮换、TLS 策略或真实网络路径。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
-- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端 DeepSeek 模型任务、审批、取消、同步和回滚。真实 artifact 安装、初始化及 localhost Responses stub 文本 turn 已通过，但 stub 不证明 DeepSeek 行为、模型质量或完整企业任务闭环。
+- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端 DeepSeek 模型任务。真实 artifact 安装、初始化，以及 localhost Responses stub 下的审批、取消、同步和回滚机械闭环均已通过，但 stub 不证明 DeepSeek 行为、模型质量或中央代理到真实 DeepSeek 的完整企业任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。
 - 完成小规模设备灰度、故障注入和长任务测试，包括进程崩溃、网络抖动、服务重启、磁盘不足、并发冲突和审计重放。
 - Durable outbox 仍是单机本地文件，不替代磁盘损坏、磁盘耗尽、设备丢失或跨设备复制测试；达到条数/单事件/总量上限时 daemon 会拒绝继续假装成功，需要运维介入并保留旧链路。
