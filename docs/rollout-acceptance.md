@@ -10,7 +10,8 @@
 |---|---|
 | FastAPI | `pytest` 23 项通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
-| Rust daemon | `cargo test` 42 项通过 |
+| Rust daemon | `cargo test` 43 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
+| 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
 | 旧链路 | 根目录 legacy build 与 smoke test 通过 |
 | 依赖审计 | `npm audit` 0 个漏洞 |
 
@@ -20,7 +21,7 @@
 
 - 在真实 PostgreSQL 实例上执行全量 Alembic upgrade 和 downgrade/恢复演练。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
-- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端任务、审批、取消、同步和回滚。
+- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端模型任务、审批、取消、同步和回滚。真实 artifact 的安装与 App Server 初始化 smoke 已通过，但不能替代完整任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。
 - 完成小规模设备灰度、故障注入和长任务测试，包括进程崩溃、网络抖动、服务重启、磁盘不足、并发冲突和审计重放。
 

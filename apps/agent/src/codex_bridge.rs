@@ -747,6 +747,42 @@ fn main() {
             PINNED_PROTOCOL_VERSION
         ));
     }
+    #[tokio::test]
+    #[ignore = "requires COMPANY_AGENT_REAL_CODEX pointing to an approved pinned Codex artifact"]
+    async fn real_pinned_codex_artifact_initializes_with_strict_config() {
+        let Some(artifact) = std::env::var_os("COMPANY_AGENT_REAL_CODEX").map(PathBuf::from) else {
+            eprintln!("skipped: COMPANY_AGENT_REAL_CODEX is not set");
+            return;
+        };
+        let base = std::env::temp_dir().join(format!(
+            "company-agent-real-codex-smoke-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let managed_runtime_dir = base.join("runtime");
+        let release = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: hex_sha256(&fs::read(&artifact).expect("read real Codex artifact")),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        let result = async {
+            install_release(&managed_runtime_dir, &artifact, &release)?;
+            let server = CodexAppServer::start(RuntimeConfig {
+                managed_runtime_dir,
+                release,
+                request_timeout: Duration::from_secs(15),
+                codex_home: base.join("codex-home"),
+                responses_base_url: "http://127.0.0.1:9/v1".into(),
+                auth_command: std::env::current_exe()?,
+            })
+            .await?;
+            server.shutdown().await
+        }
+        .await;
+        let _ = fs::remove_dir_all(&base);
+        result.expect("real pinned Codex artifact must initialize and shut down");
+    }
     #[test]
     fn install_is_managed_and_runtime_detects_tampering() {
         let artifact = compile_mock_server();

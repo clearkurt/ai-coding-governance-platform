@@ -960,6 +960,21 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_source_contains_no_known_mojibake_markers() {
+        let source = include_str!("main.rs");
+        for marker in [
+            "\u{951b}",
+            "\u{9286}",
+            "\u{9225}",
+            "\u{9983}",
+            "\u{6d7c}\u{4f7b}\u{4e7f}",
+            "\u{93c3}\u{72b3}\u{6ccb}\u{7eeb}",
+        ] {
+            assert!(!source.contains(marker), "mojibake marker found: {marker}");
+        }
+    }
     use serde_json::json;
 
     #[test]
