@@ -918,22 +918,36 @@ def test_real_tls_model_proxy_enforces_tokens_and_records_stream_usage(migrated_
             await session.commit()
             store = PostgresStore(session)
             identity = await store.find_user(team_id, email)
-            await store.create_pairing_code(identity, "proxy-pair", utcnow() + timedelta(minutes=5))
-            device, _, projects = await store.consume_pairing_code(
-                "proxy-pair", "proxy-device", "proxy-device-key", "runtime", ["Proxy project"]
-            )
             conversation = await store.create_conversation(identity, "Proxy conversation")
+            devices = []
             tasks = []
             for name in ("valid", "expired", "revoked"):
+                pairing_code = f"proxy-pair-{name}"
+                await store.create_pairing_code(identity, pairing_code, utcnow() + timedelta(minutes=5))
+                device, _, projects = await store.consume_pairing_code(
+                    pairing_code,
+                    f"proxy-device-{name}",
+                    f"proxy-device-key-{name}",
+                    "runtime",
+                    [f"Proxy project {name}"],
+                )
                 task, _ = await store.create_task(
                     identity, device.id, projects[0].id, conversation.id, f"proxy-{name}", "prompt"
                 )
+                devices.append(device)
                 tasks.append(task)
+            assert len({device.id for device in devices}) == 3
+            assert len({task.project_id for task in tasks}) == 3
             await store.create_model_token(
-                device, tasks[0].id, valid_token, uuid.uuid4().hex, "deepseek-v4-flash", utcnow() + timedelta(minutes=5)
+                devices[0],
+                tasks[0].id,
+                valid_token,
+                uuid.uuid4().hex,
+                "deepseek-v4-flash",
+                utcnow() + timedelta(minutes=5),
             )
             await store.create_model_token(
-                device,
+                devices[1],
                 tasks[1].id,
                 expired_token,
                 uuid.uuid4().hex,
@@ -941,14 +955,14 @@ def test_real_tls_model_proxy_enforces_tokens_and_records_stream_usage(migrated_
                 utcnow() - timedelta(seconds=1),
             )
             await store.create_model_token(
-                device,
+                devices[2],
                 tasks[2].id,
                 revoked_token,
                 uuid.uuid4().hex,
                 "deepseek-v4-flash",
                 utcnow() + timedelta(minutes=5),
             )
-            await store.append_event(device, tasks[2].id, "proxy-terminal", "turn/completed", {})
+            await store.append_event(devices[2], tasks[2].id, "proxy-terminal", "turn/completed", {})
 
         def unused_port() -> int:
             sock = socket.socket()
