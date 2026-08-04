@@ -8,7 +8,7 @@
 
 | 范围 | 结果 |
 |---|---|
-| FastAPI | 普通 `pytest` 24 项通过、1 项真实 PostgreSQL integration 默认 skipped；该 integration 已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
+| FastAPI | 普通 `pytest` 24 项通过、2 项真实 PostgreSQL integration 默认 skipped；migration 与 `PostgresStore` lifecycle integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
 | Rust daemon | `cargo test` 43 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
@@ -19,7 +19,7 @@
 
 ## 尚未验证的生产门槛
 
-- 本机 PostgreSQL 16 已手工完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。现已提供环境变量驱动的随机专用数据库自动化复验。生产同版本实例的备份、恢复和故障演练仍未完成。
+- 本机 PostgreSQL 16 已完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。随机专用数据库上的 migration 与真实 `PostgresStore` lifecycle integration 均已通过，覆盖会话、单次配对、任务幂等、审批、模型令牌、用量、审计、回滚与跨团队隔离。生产同版本实例的备份、恢复和故障演练仍未完成。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
 - 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端模型任务、审批、取消、同步和回滚。真实 artifact 的安装与 App Server 初始化 smoke 已通过，但不能替代完整任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。

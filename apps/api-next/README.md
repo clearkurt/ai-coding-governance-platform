@@ -35,7 +35,7 @@ Approval decisions and rollback requests use stable delivery identifiers, replay
 
 For local HTTP development set `COMPANY_AGENT_SESSION_COOKIE_SECURE=false`. Production must use HTTPS/WSS and leave secure cookies enabled.
 
-The current acceptance baseline is 24 passing regular pytest tests, one environment-gated PostgreSQL integration test, and a clean Ruff check. The PostgreSQL integration has been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
+The current acceptance baseline is 24 passing regular pytest tests, two environment-gated PostgreSQL integration tests, and a clean Ruff check. Both the migration lifecycle and the real `PostgresStore` lifecycle integrations have been run successfully against a local PostgreSQL 16 instance. Real DeepSeek Responses traffic and production TLS/WSS remain release gates; see [rollout-acceptance.md](../../docs/rollout-acceptance.md).
 
 To repeat the destructive migration check safely, supply an administrative URL for an existing PostgreSQL instance. The test creates a random dedicated login/database, runs upgrade/downgrade/re-upgrade only there, terminates its own remaining connections, and removes both objects in `finally`. It never prints or stores the password:
 
@@ -46,3 +46,5 @@ Remove-Item Env:COMPANY_AGENT_TEST_POSTGRES_ADMIN_URL
 ```
 
 Without the variable, the integration test is skipped. Use a disposable PostgreSQL instance or a test administrator with `CREATEDB` and `CREATEROLE`; superuser is not required. The test temporarily grants its randomly created child role to that administrator so PostgreSQL permits `CREATE DATABASE ... OWNER`, then revokes the membership during cleanup. Never point application credentials at this test.
+
+The same command also runs the real `PostgresStore` lifecycle against a separately randomized migrated database. It covers sessions, single-use pairing, discovery, conversations, idempotent and single-active tasks, delivery/event deduplication, approvals, task-bound model tokens, usage deduplication, terminal revocation, audit, rollback, and cross-team isolation with real transactions and constraints.
