@@ -21,7 +21,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from alembic import command
-from app.db.models import AuditEvent, Task, TaskEvent, TaskStatus, Team, User
+from app.db.models import AuditEvent, ModelUsage, Task, TaskEvent, TaskStatus, Team, User
 from app.device_registry import DeviceConnectionRegistry
 from app.main import app, websocket_store
 from app.rollout_report import collect_report
@@ -887,6 +887,276 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
         for arguments in commands:
             _run_openssl(wsl, arguments)
         asyncio.run(exercise(server_certificate, server_key, ca_certificate))
+
+
+@pytest.mark.integration
+def test_real_tls_model_proxy_enforces_tokens_and_records_stream_usage(migrated_postgres_url: str) -> None:
+    """Exercise the real TLS/HTTP proxy boundary; this is not a provider compatibility test."""
+    wsl = shutil.which("wsl")
+    if not wsl:
+        pytest.skip("wsl with OpenSSL is required to generate temporary TLS integration certificates")
+    probe = subprocess.run(
+        [wsl, "-d", "Ubuntu-24.04", "--", "openssl", "version"], capture_output=True, check=False, timeout=15
+    )
+    if probe.returncode != 0:
+        pytest.skip("OpenSSL is unavailable in the Ubuntu-24.04 WSL distribution")
+
+    async def exercise(certificate: Path, private_key: Path, ca_certificate: Path, counter: Path) -> None:
+        import httpx
+
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        valid_token, expired_token, revoked_token = (uuid.uuid4().hex for _ in range(3))
+        async with sessions() as session:
+            team = Team(slug=f"proxy-{uuid.uuid4().hex}", name="Proxy")
+            session.add(team)
+            await session.flush()
+            user = User(team_id=team.id, email="proxy@example.test", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            team_id, email = team.id, user.email
+            await session.commit()
+            store = PostgresStore(session)
+            identity = await store.find_user(team_id, email)
+            await store.create_pairing_code(identity, "proxy-pair", utcnow() + timedelta(minutes=5))
+            device, _, projects = await store.consume_pairing_code(
+                "proxy-pair", "proxy-device", "proxy-device-key", "runtime", ["Proxy project"]
+            )
+            conversation = await store.create_conversation(identity, "Proxy conversation")
+            tasks = []
+            for name in ("valid", "expired", "revoked"):
+                task, _ = await store.create_task(
+                    identity, device.id, projects[0].id, conversation.id, f"proxy-{name}", "prompt"
+                )
+                tasks.append(task)
+            await store.create_model_token(
+                device, tasks[0].id, valid_token, uuid.uuid4().hex, "deepseek-v4-flash", utcnow() + timedelta(minutes=5)
+            )
+            await store.create_model_token(
+                device,
+                tasks[1].id,
+                expired_token,
+                uuid.uuid4().hex,
+                "deepseek-v4-flash",
+                utcnow() - timedelta(seconds=1),
+            )
+            await store.create_model_token(
+                device,
+                tasks[2].id,
+                revoked_token,
+                uuid.uuid4().hex,
+                "deepseek-v4-flash",
+                utcnow() + timedelta(minutes=5),
+            )
+            await store.append_event(device, tasks[2].id, "proxy-terminal", "turn/completed", {})
+
+        def unused_port() -> int:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            return port
+
+        upstream_port, central_port = unused_port(), unused_port()
+        while central_port == upstream_port:
+            central_port = unused_port()
+        provider_key = f"test-only-{uuid.uuid4().hex}"
+        api_root = Path(__file__).parents[1]
+        upstream_environment = {
+            **os.environ,
+            "TEST_UPSTREAM_API_KEY": provider_key,
+            "TEST_UPSTREAM_COUNTER": str(counter),
+        }
+        central_environment = {
+            **os.environ,
+            "COMPANY_AGENT_DATABASE_URL": migrated_postgres_url,
+            "COMPANY_AGENT_ENVIRONMENT": "production",
+            "COMPANY_AGENT_DEEPSEEK_API_KEY": provider_key,
+            "COMPANY_AGENT_DEEPSEEK_BASE_URL": f"https://127.0.0.1:{upstream_port}",
+            "COMPANY_AGENT_CODEX_ROLLOUT_MODE": "all",
+            "COMPANY_AGENT_RESPONSES_TIMEOUT_SECONDS": "5",
+            "SSL_CERT_FILE": str(ca_certificate),
+        }
+        upstream = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tests.network_upstream:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(upstream_port),
+            "--ssl-certfile",
+            str(certificate),
+            "--ssl-keyfile",
+            str(private_key),
+            "--log-level",
+            "critical",
+            "--no-access-log",
+            cwd=api_root,
+            env=upstream_environment,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        central = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(central_port),
+            "--log-level",
+            "critical",
+            "--no-access-log",
+            cwd=api_root,
+            env=central_environment,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        async def wait_ready(process: asyncio.subprocess.Process, port: int, label: str) -> None:
+            for _ in range(250):
+                if process.returncode is not None:
+                    raise RuntimeError(f"{label} uvicorn child exited during startup")
+                try:
+                    _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+                except OSError:
+                    await asyncio.sleep(0.02)
+            raise TimeoutError(f"{label} uvicorn child did not start")
+
+        async def stop(process: asyncio.subprocess.Process) -> None:
+            if process.returncode is not None:
+                return
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+
+        try:
+            await wait_ready(upstream, upstream_port, "upstream")
+            await wait_ready(central, central_port, "central")
+            payload = {"model": "deepseek-v4-flash", "stream": True, "input": "network boundary"}
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{central_port}", timeout=10) as client:
+                response = await client.post(
+                    "/v1/responses", headers={"Authorization": f"Bearer {valid_token}"}, json=payload
+                )
+                assert response.status_code == 200
+                assert response.headers["content-type"].startswith("text/event-stream")
+                assert response.headers["x-request-id"] == "resp_tls_network"
+                assert response.content.endswith(b"data: [DONE]\n\n")
+                event_types = [
+                    json.loads(line[6:])["type"]
+                    for line in response.content.splitlines()
+                    if line.startswith(b"data: {")
+                ]
+                assert event_types == [
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_item.added",
+                    "response.content_part.added",
+                    "response.output_text.delta",
+                    "response.output_text.done",
+                    "response.content_part.done",
+                    "response.output_item.done",
+                    "response.completed",
+                ]
+                for token in (None, expired_token, revoked_token):
+                    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+                    denied = await client.post("/v1/responses", headers=headers, json=payload)
+                    assert denied.status_code == 401
+            assert counter.read_text(encoding="ascii") == "1"
+            for _ in range(100):
+                async with sessions() as session:
+                    usage = await session.scalar(
+                        select(ModelUsage).where(ModelUsage.provider_request_id == "resp_tls_network")
+                    )
+                    if usage:
+                        assert (usage.input_tokens, usage.output_tokens, usage.task_id) == (11, 7, tasks[0].id)
+                        assert (
+                            await session.scalar(
+                                select(func.count())
+                                .select_from(ModelUsage)
+                                .where(ModelUsage.provider_request_id == "resp_tls_network")
+                            )
+                            == 1
+                        )
+                        break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("stream usage was not persisted")
+        finally:
+            await stop(central)
+            await stop(upstream)
+            await engine.dispose()
+
+    with tempfile.TemporaryDirectory(prefix="company-agent-proxy-tls-") as temporary:
+        tls_directory = Path(temporary)
+        counter = tls_directory / "requests.count"
+        counter.write_text("0", encoding="ascii")
+        extension = tls_directory / "server.ext"
+        extension.write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", encoding="utf-8")
+        ca_key, ca_certificate = tls_directory / "ca.key", tls_directory / "ca.crt"
+        server_key, server_request = tls_directory / "server.key", tls_directory / "server.csr"
+        server_certificate = tls_directory / "server.crt"
+        commands = [
+            [
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                _windows_path_to_wsl(wsl, ca_key),
+                "-out",
+                _windows_path_to_wsl(wsl, ca_certificate),
+                "-days",
+                "1",
+                "-sha256",
+                "-subj",
+                "/CN=Proxy Test CA",
+            ],
+            [
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                _windows_path_to_wsl(wsl, server_key),
+                "-out",
+                _windows_path_to_wsl(wsl, server_request),
+                "-sha256",
+                "-subj",
+                "/CN=127.0.0.1",
+            ],
+            [
+                "x509",
+                "-req",
+                "-in",
+                _windows_path_to_wsl(wsl, server_request),
+                "-CA",
+                _windows_path_to_wsl(wsl, ca_certificate),
+                "-CAkey",
+                _windows_path_to_wsl(wsl, ca_key),
+                "-CAcreateserial",
+                "-out",
+                _windows_path_to_wsl(wsl, server_certificate),
+                "-days",
+                "1",
+                "-sha256",
+                "-extfile",
+                _windows_path_to_wsl(wsl, extension),
+            ],
+        ]
+        for arguments in commands:
+            _run_openssl(wsl, arguments)
+        asyncio.run(exercise(server_certificate, server_key, ca_certificate, counter))
 
 
 @pytest.mark.integration
