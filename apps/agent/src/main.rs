@@ -1,7 +1,8 @@
+mod codex_bridge;
 mod protocol;
 mod sandbox;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
@@ -12,37 +13,431 @@ use protocol::{Envelope, PairPayload, RootRequest};
 use rand::rngs::OsRng;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SERVICE: &str = "company-ai-agent";
 
 #[derive(Parser)]
-#[command(name="company-agent", about="企业 AI 编程助手受控本地执行器")]
-struct Cli { #[command(subcommand)] command: Command }
+#[command(name = "company-agent", about = "企业 AI 编程助手受控本地执行器")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 #[derive(Subcommand)]
-enum Command { Enroll { #[arg(long)] server: String, #[arg(long)] code: String, #[arg(long, default_value="Windows Agent")] name: String }, Run, Status }
+enum Command {
+    Enroll {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        code: String,
+        #[arg(long, default_value = "Windows Agent")]
+        name: String,
+    },
+    Run,
+    Status,
+    ConfigureCodex {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        sha256: Option<String>,
+    },
+    UseLegacy,
+}
 #[derive(Serialize, Deserialize, Clone)]
-struct Root { id: String, path: PathBuf, label: String }
+struct Root {
+    id: String,
+    path: PathBuf,
+    label: String,
+}
 #[derive(Serialize, Deserialize)]
-struct Config { device_id: String, server: String, roots: Vec<Root>, version: String, public_key: String }
+struct Config {
+    device_id: String,
+    server: String,
+    roots: Vec<Root>,
+    version: String,
+    public_key: String,
+    #[serde(default)]
+    codex: Option<CodexSettings>,
+}
 
-fn config_path() -> Result<PathBuf> { let dirs=ProjectDirs::from("com","company","ai-agent").context("无法定位用户配置目录")?; fs::create_dir_all(dirs.config_dir())?; Ok(dirs.config_dir().join("agent.json")) }
-fn secret_entry() -> Result<Entry> { Ok(Entry::new(SERVICE, "device-secret")?) }
-fn save_config(config: &Config, secret: &str) -> Result<()> { fs::write(config_path()?, serde_json::to_vec_pretty(config)?)?; secret_entry()?.set_password(secret)?; Ok(()) }
-fn load_config() -> Result<(Config,String)> { let config:Config=serde_json::from_slice(&fs::read(config_path().context("请先运行 enroll")?)?)?; Ok((config,secret_entry()?.get_password()?)) }
-fn websocket_url(server: &str) -> Result<String> { let value=server.trim_end_matches('/'); if value.starts_with("ws://localhost") || value.starts_with("ws://127.0.0.1") || value.starts_with("wss://") { Ok(format!("{value}/api/agent/ws")) } else { bail!("仅允许 localhost 的 ws:// 或生产 wss:// 服务器") } }
-fn public_key() -> (SigningKey,String) { let key=SigningKey::generate(&mut OsRng); let public=base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(VerifyingKey::from(&key).as_bytes()); (key,public) }
-async fn enroll(server: String, code: String, name: String) -> Result<()> { let picked=pick_folder_foreground("选择允许 AI Agent 访问的工程根目录").await?; let canonical=fs::canonicalize(&picked)?; let (_, public_key)=public_key(); let root=Root { id: String::new(), label: canonical.file_name().unwrap_or_default().to_string_lossy().to_string(), path: canonical }; let (mut socket,_)=connect_async(websocket_url(&server)?).await?; let payload=PairPayload { code, name, public_key: public_key.clone(), version: env!("CARGO_PKG_VERSION").into(), roots: vec![RootRequest { label: root.label.clone() }] }; socket.send(Message::Text(serde_json::to_string(&Envelope::pair(payload))?.into())).await?; let response=socket.next().await.context("服务器未返回配对结果")??.into_text()?; let result:Envelope=serde_json::from_str(&response)?; if result.r#type!="pair_result" { bail!("配对失败：{}", result.payload) } let value:serde_json::Value=serde_json::from_value(result.payload)?; let device_id=value["deviceId"].as_str().context("缺少设备 ID")?.to_owned(); let credential=value["credential"].as_str().context("缺少设备凭据")?.to_owned(); let root_id=value["roots"][0]["id"].as_str().context("缺少根目录 ID")?.to_owned(); let config=Config { device_id, server, roots: vec![Root { id:root_id, ..root }], version:env!("CARGO_PKG_VERSION").into(), public_key }; save_config(&config,&credential)?; println!("配对成功。运行 `company-agent run` 开始后台连接。"); Ok(()) }
-async fn run() -> Result<()> { let (mut config, credential)=load_config()?; let url=websocket_url(&config.server)?; loop { match run_connection(&mut config,&credential,&url).await { Ok(()) => {}, Err(error) => eprintln!("连接断开：{error:#}") }; tokio::time::sleep(Duration::from_secs(5)).await; } }
-async fn run_connection(config:&mut Config, credential:&str, url:&str) -> Result<()> { let (socket,_)=connect_async(url).await?; println!("已连接到 {url}，设备 ID：{}", config.device_id); let (mut write,mut read)=socket.split(); let rules: Vec<serde_json::Value> = config.roots.iter().map(|root| serde_json::json!({"rootId": root.id, "content": read_project_rules(root)})).collect(); write.send(Message::Text(serde_json::to_string(&Envelope::hello(&config.device_id,credential,&config.version,serde_json::Value::Array(rules)))?.into())).await?; let mut heartbeat=tokio::time::interval(Duration::from_secs(30)); loop { tokio::select! { _=heartbeat.tick()=> { write.send(Message::Text(serde_json::to_string(&Envelope::heartbeat(&config.device_id,credential))?.into())).await?; }, message=read.next()=> { let Some(message)=message else { println!("服务器关闭连接"); return Ok(()) }; let message=message?; let Message::Text(text)=message else { if message.is_close() { return Ok(()); } continue; }; let envelope:Envelope=serde_json::from_str(&text)?; if envelope.r#type=="task" { let task_id=envelope.task_id.clone().context("任务缺少 ID")?; println!("收到任务: {} kind={}",task_id,envelope.payload["kind"].as_str().unwrap_or("?")); let status=handle_task(config,&envelope).await; let response=match status { Ok(payload)=>{ if envelope.payload["kind"].as_str()==Some("select_root") { println!("select_root 完成，新目录标签: {}", payload["label"]); } Envelope::task_result(&config.device_id,&task_id,&credential,payload) }, Err(error)=>{ eprintln!("任务 {} 执行失败: {error:#}",task_id); Envelope::task_error(&config.device_id,&task_id,&credential,error.to_string()) } }; write.send(Message::Text(serde_json::to_string(&response)?.into())).await?; } } } } }
-async fn handle_task(config:&mut Config, envelope:&Envelope) -> Result<serde_json::Value> { if envelope.payload["kind"].as_str()==Some("select_root") { let root_id=envelope.payload["rootId"].as_str().context("缺少 rootId")?; let path=fs::canonicalize(pick_folder_foreground("更换 AI Agent 允许访问的工程目录").await?)?; let (label, rules) = { let root=config.roots.iter_mut().find(|root|root.id==root_id).context("未授权的项目根目录")?; root.path=path; root.label= root.path.file_name().unwrap_or_default().to_string_lossy().to_string(); (root.label.clone(), read_project_rules(root)) }; fs::write(config_path()?,serde_json::to_vec_pretty(config)?)?; return Ok(serde_json::json!({"rootId":root_id,"label":label,"rules":rules})); } sandbox::execute(&config.roots,&envelope.payload).await }
+#[derive(Serialize, Deserialize, Clone)]
+struct CodexSettings {
+    executable: PathBuf,
+    #[serde(default = "default_codex_version")]
+    expected_version: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+    #[serde(default = "default_request_timeout_seconds")]
+    request_timeout_seconds: u64,
+}
+
+fn default_codex_version() -> String {
+    codex_bridge::PINNED_PROTOCOL_VERSION.into()
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    30
+}
+
+fn config_path() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("com", "company", "ai-agent").context("无法定位用户配置目录")?;
+    fs::create_dir_all(dirs.config_dir())?;
+    Ok(dirs.config_dir().join("agent.json"))
+}
+fn secret_entry() -> Result<Entry> {
+    Ok(Entry::new(SERVICE, "device-secret")?)
+}
+fn save_config(config: &Config, secret: &str) -> Result<()> {
+    fs::write(config_path()?, serde_json::to_vec_pretty(config)?)?;
+    secret_entry()?.set_password(secret)?;
+    Ok(())
+}
+fn load_config() -> Result<(Config, String)> {
+    let config: Config =
+        serde_json::from_slice(&fs::read(config_path().context("请先运行 enroll")?)?)?;
+    Ok((config, secret_entry()?.get_password()?))
+}
+fn websocket_url(server: &str) -> Result<String> {
+    let value = server.trim_end_matches('/');
+    if value.starts_with("ws://localhost")
+        || value.starts_with("ws://127.0.0.1")
+        || value.starts_with("wss://")
+    {
+        Ok(format!("{value}/api/agent/ws"))
+    } else {
+        bail!("仅允许 localhost 的 ws:// 或生产 wss:// 服务器")
+    }
+}
+fn public_key() -> (SigningKey, String) {
+    let key = SigningKey::generate(&mut OsRng);
+    let public = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(VerifyingKey::from(&key).as_bytes());
+    (key, public)
+}
+async fn enroll(server: String, code: String, name: String) -> Result<()> {
+    let picked = pick_folder_foreground("选择允许 AI Agent 访问的工程根目录").await?;
+    let canonical = fs::canonicalize(&picked)?;
+    let (_, public_key) = public_key();
+    let root = Root {
+        id: String::new(),
+        label: canonical
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        path: canonical,
+    };
+    let (mut socket, _) = connect_async(websocket_url(&server)?).await?;
+    let payload = PairPayload {
+        code,
+        name,
+        public_key: public_key.clone(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        roots: vec![RootRequest {
+            label: root.label.clone(),
+        }],
+    };
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::pair(payload))?.into(),
+        ))
+        .await?;
+    let response = socket
+        .next()
+        .await
+        .context("服务器未返回配对结果")??
+        .into_text()?;
+    let result: Envelope = serde_json::from_str(&response)?;
+    if result.r#type != "pair_result" {
+        bail!("配对失败：{}", result.payload)
+    }
+    let value: serde_json::Value = serde_json::from_value(result.payload)?;
+    let device_id = value["deviceId"]
+        .as_str()
+        .context("缺少设备 ID")?
+        .to_owned();
+    let credential = value["credential"]
+        .as_str()
+        .context("缺少设备凭据")?
+        .to_owned();
+    let root_id = value["roots"][0]["id"]
+        .as_str()
+        .context("缺少根目录 ID")?
+        .to_owned();
+    let config = Config {
+        device_id,
+        server,
+        roots: vec![Root {
+            id: root_id,
+            ..root
+        }],
+        version: env!("CARGO_PKG_VERSION").into(),
+        public_key,
+        codex: None,
+    };
+    save_config(&config, &credential)?;
+    println!("配对成功。运行 `company-agent run` 开始后台连接。");
+    Ok(())
+}
+async fn run() -> Result<()> {
+    let (mut config, credential) = load_config()?;
+    if let Some(settings) = config.codex.clone() {
+        return run_codex(config, credential, settings).await;
+    }
+    let url = websocket_url(&config.server)?;
+    loop {
+        match run_connection(&mut config, &credential, &url).await {
+            Ok(()) => {}
+            Err(error) => eprintln!("连接断开：{error:#}"),
+        };
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn codex_websocket_url(server: &str) -> Result<String> {
+    let value = server.trim_end_matches('/');
+    if value.starts_with("ws://localhost")
+        || value.starts_with("ws://127.0.0.1")
+        || value.starts_with("wss://")
+    {
+        Ok(format!("{value}/ws/devices"))
+    } else {
+        bail!("Codex bridge only allows localhost ws:// or production wss:// servers")
+    }
+}
+
+async fn run_codex(config: Config, credential: String, settings: CodexSettings) -> Result<()> {
+    let runtime = codex_bridge::RuntimeConfig {
+        executable: settings.executable,
+        expected_version: settings.expected_version,
+        expected_sha256: settings.expected_sha256,
+        request_timeout: Duration::from_secs(settings.request_timeout_seconds.clamp(1, 300)),
+    };
+    let mut retry = Duration::from_secs(1);
+    loop {
+        match codex_bridge::CodexAppServer::start(runtime.clone()).await {
+            Ok(mut bridge) => {
+                retry = Duration::from_secs(1);
+                let mut book = codex_bridge::DispatchBook::default();
+                let mut outbox = BTreeMap::new();
+                while let Err(error) =
+                    run_codex_connection(&config, &credential, &mut bridge, &mut book, &mut outbox)
+                        .await
+                {
+                    eprintln!("Codex device connection closed: {error:#}");
+                    if !bridge.is_running().await.unwrap_or(false) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                let _ = bridge.shutdown().await;
+            }
+            Err(error) => eprintln!("Codex App Server failed to start: {error:#}"),
+        }
+        tokio::time::sleep(retry).await;
+        retry = (retry * 2).min(Duration::from_secs(60));
+    }
+}
+
+async fn send_json<S>(write: &mut S, value: serde_json::Value) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    write
+        .send(Message::Text(serde_json::to_string(&value)?.into()))
+        .await?;
+    Ok(())
+}
+
+async fn run_codex_connection(
+    config: &Config,
+    credential: &str,
+    bridge: &mut codex_bridge::CodexAppServer,
+    book: &mut codex_bridge::DispatchBook,
+    outbox: &mut BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    let url = codex_websocket_url(&config.server)?;
+    let (socket, _) = connect_async(&url).await?;
+    let (mut write, mut read) = socket.split();
+    send_json(
+        &mut write,
+        serde_json::json!({
+            "type": "authenticate",
+            "device_id": config.device_id,
+            "credential": credential,
+            "runtime_version": format!("company-agent/{} codex/{}", env!("CARGO_PKG_VERSION"), codex_bridge::PINNED_PROTOCOL_VERSION),
+        }),
+    )
+    .await?;
+    let authenticated = read
+        .next()
+        .await
+        .context("device gateway closed before authentication")??;
+    let authenticated: serde_json::Value = serde_json::from_str(authenticated.to_text()?)?;
+    if authenticated["type"] != "authenticated" {
+        bail!("device gateway rejected Codex bridge authentication")
+    }
+    for event in outbox.values() {
+        send_json(&mut write, event.clone()).await?;
+    }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                send_json(&mut write, serde_json::json!({"type":"heartbeat","runtime_version":config.version})).await?;
+            }
+            notification = bridge.notifications.recv() => {
+                let notification = notification.context("Codex notification stream closed")?;
+                let thread_id = notification.params.get("threadId").and_then(serde_json::Value::as_str).unwrap_or("");
+                let turn_id = notification.params.get("turnId").and_then(serde_json::Value::as_str).unwrap_or("");
+                let Some(task_id) = book.task_for_event(thread_id, turn_id) else { continue };
+                let source_event_id = notification.source_event_id.clone();
+                let event = serde_json::json!({
+                    "type":"task.event",
+                    "task_id":task_id,
+                    "source_event_id":source_event_id,
+                    "event_type":notification.method,
+                    "payload":notification.params,
+                });
+                outbox.insert(source_event_id, event.clone());
+                send_json(&mut write, event).await?;
+            }
+            request = bridge.server_requests.recv() => {
+                let request = request.context("Codex server request stream closed")?;
+                let thread_id = request.params.get("threadId").and_then(serde_json::Value::as_str).unwrap_or("");
+                let turn_id = request.params.get("turnId").and_then(serde_json::Value::as_str).unwrap_or("");
+                let Some(task_id) = book.task_for_event(thread_id, turn_id) else {
+                    bridge.respond(request.id, Err(anyhow::anyhow!("approval request is not associated with an active task"))).await?;
+                    continue;
+                };
+                let source_event_id = format!("codex-request:{}", request.id);
+                let event = serde_json::json!({
+                    "type":"task.event",
+                    "task_id":task_id,
+                    "source_event_id":source_event_id,
+                    "event_type":request.method,
+                    "payload":{"request_id":request.id,"params":request.params},
+                });
+                outbox.insert(source_event_id, event.clone());
+                send_json(&mut write, event).await?;
+            }
+            message = read.next() => {
+                let Some(message) = message else { bail!("device gateway closed") };
+                let message = message?;
+                if message.is_close() { bail!("device gateway closed") }
+                let Message::Text(text) = message else { continue };
+                let value: serde_json::Value = serde_json::from_str(&text)?;
+                match value["type"].as_str().unwrap_or("") {
+                    "heartbeat.ack" | "task.dispatch.acknowledged" => {}
+                    "task.event.ack" => {
+                        if let Some(source) = value["source_event_id"].as_str() { outbox.remove(source); }
+                    }
+                    "task.dispatch" => {
+                        let task_id = value["task_id"].as_str().context("dispatch missing task_id")?;
+                        let delivery_id = value["delivery_id"].as_str().context("dispatch missing delivery_id")?;
+                        if book.interrupt_params(task_id).is_none() {
+                            let root_id = value["root_id"].as_str().context("dispatch missing root_id")?;
+                            let prompt = value["prompt"].as_str().context("dispatch missing prompt")?;
+                            let canonical = authorized_root(config, root_id)?;
+                            let thread_id = bridge.start_thread(&canonical).await?;
+                            let turn_id = bridge.start_turn(&thread_id, &canonical, prompt).await?;
+                            book.register(task_id.to_owned(), thread_id, turn_id);
+                        }
+                        send_json(&mut write, serde_json::json!({"type":"task.dispatch.ack","task_id":task_id,"delivery_id":delivery_id})).await?;
+                    }
+                    "task.cancel" => {
+                        let task_id = value["task_id"].as_str().context("cancel missing task_id")?;
+                        if let Some((thread_id, turn_id)) = book.interrupt_params(task_id) { bridge.interrupt(thread_id, turn_id).await?; }
+                    }
+                    "approval.decision" => {
+                        let request_id = value["request_id"].as_u64().context("approval decision missing request_id")?;
+                        if value["approved"].as_bool().unwrap_or(false) {
+                            bridge.respond(request_id, Ok(value.get("result").cloned().unwrap_or_else(|| serde_json::json!({"decision":"accept"})))).await?;
+                        } else {
+                            bridge.respond(request_id, Ok(value.get("result").cloned().unwrap_or_else(|| serde_json::json!({"decision":"decline"})))).await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn authorized_root(config: &Config, root_id: &str) -> Result<PathBuf> {
+    let root = config
+        .roots
+        .iter()
+        .find(|root| root.id == root_id)
+        .context("dispatch selected an unauthorized root_id")?;
+    let canonical = fs::canonicalize(&root.path).context("authorized root is unavailable")?;
+    if canonical != root.path {
+        bail!("authorized root changed since enrollment")
+    }
+    Ok(canonical)
+}
+async fn run_connection(config: &mut Config, credential: &str, url: &str) -> Result<()> {
+    let (socket, _) = connect_async(url).await?;
+    println!("已连接到 {url}，设备 ID：{}", config.device_id);
+    let (mut write, mut read) = socket.split();
+    let rules: Vec<serde_json::Value> = config
+        .roots
+        .iter()
+        .map(|root| serde_json::json!({"rootId": root.id, "content": read_project_rules(root)}))
+        .collect();
+    write
+        .send(Message::Text(
+            serde_json::to_string(&Envelope::hello(
+                &config.device_id,
+                credential,
+                &config.version,
+                serde_json::Value::Array(rules),
+            ))?
+            .into(),
+        ))
+        .await?;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! { _=heartbeat.tick()=> { write.send(Message::Text(serde_json::to_string(&Envelope::heartbeat(&config.device_id,credential))?.into())).await?; }, message=read.next()=> { let Some(message)=message else { println!("服务器关闭连接"); return Ok(()) }; let message=message?; let Message::Text(text)=message else { if message.is_close() { return Ok(()); } continue; }; let envelope:Envelope=serde_json::from_str(&text)?; if envelope.r#type=="task" { let task_id=envelope.task_id.clone().context("任务缺少 ID")?; println!("收到任务: {} kind={}",task_id,envelope.payload["kind"].as_str().unwrap_or("?")); let status=handle_task(config,&envelope).await; let response=match status { Ok(payload)=>{ if envelope.payload["kind"].as_str()==Some("select_root") { println!("select_root 完成，新目录标签: {}", payload["label"]); } Envelope::task_result(&config.device_id,&task_id,&credential,payload) }, Err(error)=>{ eprintln!("任务 {} 执行失败: {error:#}",task_id); Envelope::task_error(&config.device_id,&task_id,&credential,error.to_string()) } }; write.send(Message::Text(serde_json::to_string(&response)?.into())).await?; } } }
+    }
+}
+async fn handle_task(config: &mut Config, envelope: &Envelope) -> Result<serde_json::Value> {
+    if envelope.payload["kind"].as_str() == Some("select_root") {
+        let root_id = envelope.payload["rootId"].as_str().context("缺少 rootId")?;
+        let path =
+            fs::canonicalize(pick_folder_foreground("更换 AI Agent 允许访问的工程目录").await?)?;
+        let (label, rules) = {
+            let root = config
+                .roots
+                .iter_mut()
+                .find(|root| root.id == root_id)
+                .context("未授权的项目根目录")?;
+            root.path = path;
+            root.label = root
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            (root.label.clone(), read_project_rules(root))
+        };
+        fs::write(config_path()?, serde_json::to_vec_pretty(config)?)?;
+        return Ok(serde_json::json!({"rootId":root_id,"label":label,"rules":rules}));
+    }
+    sandbox::execute(&config.roots, &envelope.payload).await
+}
 
 fn read_project_rules(root: &Root) -> String {
     const LIMIT: usize = 64 * 1024;
     match fs::read(root.path.join("AGENTS.md")) {
         Ok(bytes) => {
-            let trimmed = if bytes.len() > LIMIT { &bytes[..LIMIT] } else { &bytes[..] };
+            let trimmed = if bytes.len() > LIMIT {
+                &bytes[..LIMIT]
+            } else {
+                &bytes[..]
+            };
             String::from_utf8_lossy(trimmed).into_owned()
         }
         Err(_) => String::new(),
@@ -62,14 +457,28 @@ fn bring_picker_to_front() {}
 fn pump_foreground() {
     use windows_sys::Win32::System::Console::GetConsoleWindow;
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, HWND_TOPMOST,
+        IsWindowVisible, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+        SetWindowPos, ShowWindow,
+    };
     unsafe extern "system" fn find_dialog(hwnd: *mut core::ffi::c_void, lparam: isize) -> i32 {
         unsafe {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid != lparam as u32 || IsWindowVisible(hwnd) == 0 || hwnd == GetConsoleWindow() { return 1; }
+            if pid != lparam as u32 || IsWindowVisible(hwnd) == 0 || hwnd == GetConsoleWindow() {
+                return 1;
+            }
             ShowWindow(hwnd, SW_RESTORE);
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
             let foreground = GetForegroundWindow();
             let mut foreground_thread: u32 = 0;
             GetWindowThreadProcessId(foreground, &mut foreground_thread);
@@ -92,7 +501,9 @@ fn pump_foreground() {}
 #[cfg(windows)]
 fn restore_notopmost() {
     use windows_sys::Win32::System::Console::GetConsoleWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, SetWindowPos, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
     unsafe extern "system" fn clear_topmost(hwnd: *mut core::ffi::c_void, lparam: isize) -> i32 {
         unsafe {
             let mut pid: u32 = 0;
@@ -114,7 +525,9 @@ fn restore_notopmost() {}
 #[cfg(windows)]
 fn guard_console_close() {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-    unsafe extern "system" fn ignore(_: u32) -> i32 { 1 }
+    unsafe extern "system" fn ignore(_: u32) -> i32 {
+        1
+    }
     unsafe {
         // 忽略控制台关闭事件，防止误关 Agent 窗口导致进程退出。
         SetConsoleCtrlHandler(Some(ignore), 1);
@@ -137,17 +550,76 @@ async fn pick_folder_foreground(title: &str) -> Result<PathBuf> {
         }
     };
     restore_notopmost();
-    result.map(|handle| handle.path().to_path_buf()).context("未选择目录")
+    result
+        .map(|handle| handle.path().to_path_buf())
+        .context("未选择目录")
 }
 
 #[cfg(not(windows))]
 async fn pick_folder_foreground(title: &str) -> Result<PathBuf> {
-    let picked = AsyncFileDialog::new().set_title(title).pick_folder().await.context("未选择目录")?;
+    let picked = AsyncFileDialog::new()
+        .set_title(title)
+        .pick_folder()
+        .await
+        .context("未选择目录")?;
     Ok(picked.path().to_path_buf())
 }
-fn status() -> Result<()> { let (config,_)=load_config()?; println!("设备：{}\n服务器：{}\n根目录：{}",config.device_id,config.server,config.roots.iter().map(|r|r.path.display().to_string()).collect::<Vec<_>>().join(", ")); Ok(()) }
+fn status() -> Result<()> {
+    let (config, _) = load_config()?;
+    println!(
+        "设备：{}\n服务器：{}\n根目录：{}",
+        config.device_id,
+        config.server,
+        config
+            .roots
+            .iter()
+            .map(|r| r.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
+fn configure_codex(executable: PathBuf, sha256: Option<String>) -> Result<()> {
+    let (mut config, _) = load_config()?;
+    let settings = CodexSettings {
+        executable,
+        expected_version: default_codex_version(),
+        expected_sha256: sha256,
+        request_timeout_seconds: default_request_timeout_seconds(),
+    };
+    codex_bridge::RuntimeConfig {
+        executable: settings.executable.clone(),
+        expected_version: settings.expected_version.clone(),
+        expected_sha256: settings.expected_sha256.clone(),
+        request_timeout: Duration::from_secs(settings.request_timeout_seconds),
+    }
+    .validate()?;
+    config.codex = Some(settings);
+    fs::write(config_path()?, serde_json::to_vec_pretty(&config)?)?;
+    println!("Codex bridge configured; restart company-agent run to activate it.");
+    Ok(())
+}
+
+fn use_legacy() -> Result<()> {
+    let (mut config, _) = load_config()?;
+    config.codex = None;
+    fs::write(config_path()?, serde_json::to_vec_pretty(&config)?)?;
+    println!("Legacy executor selected; restart company-agent run to activate it.");
+    Ok(())
+}
 #[tokio::main]
-async fn main() -> Result<()> { guard_console_close(); let cli=Cli::parse(); match cli.command { Command::Enroll{server,code,name}=>enroll(server,code,name).await, Command::Run=>run().await, Command::Status=>status() } }
+async fn main() -> Result<()> {
+    guard_console_close();
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Enroll { server, code, name } => enroll(server, code, name).await,
+        Command::Run => run().await,
+        Command::Status => status(),
+        Command::ConfigureCodex { executable, sha256 } => configure_codex(executable, sha256),
+        Command::UseLegacy => use_legacy(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -156,7 +628,12 @@ mod tests {
 
     #[test]
     fn task_result_carries_credential() {
-        let envelope = Envelope::task_result("device-1", "task-1", "secret", json!({"rootId": "root-1", "label": "新目录"}));
+        let envelope = Envelope::task_result(
+            "device-1",
+            "task-1",
+            "secret",
+            json!({"rootId": "root-1", "label": "新目录"}),
+        );
         assert_eq!(envelope.r#type, "task_result");
         assert_eq!(envelope.payload["status"], "completed");
         assert_eq!(envelope.payload["credential"], "secret");
@@ -176,10 +653,36 @@ mod tests {
     fn reads_project_rules_from_agents_md() {
         let dir = std::env::temp_dir().join(format!("agent-rules-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let root = Root { id: "root".into(), path: dir.clone(), label: "test".into() };
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
         assert_eq!(read_project_rules(&root), "");
         fs::write(dir.join("AGENTS.md"), "# 团队规范\n- 使用中文").unwrap();
         assert_eq!(read_project_rules(&root), "# 团队规范\n- 使用中文");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_dispatch_accepts_only_an_enrolled_root_id() {
+        let dir = std::env::temp_dir().join(format!("agent-codex-root-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let canonical = fs::canonicalize(&dir).unwrap();
+        let config = Config {
+            device_id: "device".into(),
+            server: "ws://localhost:8081".into(),
+            roots: vec![Root {
+                id: "allowed".into(),
+                path: canonical.clone(),
+                label: "test".into(),
+            }],
+            version: "test".into(),
+            public_key: "test".into(),
+            codex: None,
+        };
+        assert_eq!(authorized_root(&config, "allowed").unwrap(), canonical);
+        assert!(authorized_root(&config, "other").is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

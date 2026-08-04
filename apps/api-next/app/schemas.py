@@ -39,6 +39,7 @@ class CreateTaskRequest(BaseModel):
     project_id: UUID
     conversation_id: UUID
     idempotency_key: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=200_000)
 
 
 class TaskOut(BaseModel):
@@ -47,6 +48,7 @@ class TaskOut(BaseModel):
     device_id: UUID
     project_id: UUID
     conversation_id: UUID
+    root_id: str
     status: str
 
 

@@ -158,6 +158,8 @@ class Task(IdTimestampMixin, TeamScopedMixin, Base):
     project_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     conversation_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     turn_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    root_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     delivery_id: Mapped[str] = mapped_column(String(128), nullable=False, default=lambda: str(uuid.uuid4()))
     delivery_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

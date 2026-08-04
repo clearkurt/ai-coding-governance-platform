@@ -1,0 +1,552 @@
+//! Fixed-runtime Codex App Server bridge. It is isolated from the legacy
+//! sandbox path until the server-side migration feature switch is enabled.
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, mpsc, oneshot},
+};
+
+#[cfg(windows)]
+struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn assign(child: &Child) -> Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            },
+        };
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            bail!("failed to create Codex Job Object")
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            )
+        };
+        let process = child
+            .raw_handle()
+            .context("Codex process handle unavailable")? as HANDLE;
+        let assigned = unsafe { AssignProcessToJobObject(job, process) };
+        if configured == 0 || assigned == 0 {
+            unsafe { CloseHandle(job) };
+            bail!("failed to assign Codex process to Job Object")
+        }
+        Ok(Self(job))
+    }
+}
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+pub const PINNED_PROTOCOL_VERSION: &str = "0.145.0-alpha.27";
+const STDERR_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    pub executable: PathBuf,
+    pub expected_version: String,
+    pub expected_sha256: Option<String>,
+    pub request_timeout: Duration,
+}
+
+impl RuntimeConfig {
+    pub fn validate(&self) -> Result<PathBuf> {
+        if !self.executable.is_absolute() {
+            bail!("Codex runtime path must be absolute")
+        }
+        let executable = self
+            .executable
+            .canonicalize()
+            .context("pinned Codex runtime is missing")?;
+        if !executable.is_file() {
+            bail!("pinned Codex runtime is not a file")
+        }
+        let normalized = executable.to_string_lossy().to_ascii_lowercase();
+        if normalized.contains("\\windowsapps\\") {
+            bail!("WindowsApps Codex runtime is not an allowed product runtime")
+        }
+        if let Some(expected) = &self.expected_sha256 {
+            let actual = hex_sha256(&std::fs::read(&executable)?);
+            if !actual.eq_ignore_ascii_case(expected) {
+                bail!("pinned Codex runtime SHA-256 mismatch")
+            }
+        }
+        Ok(executable)
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Clone, Debug)]
+pub struct AppNotification {
+    pub method: String,
+    pub params: Value,
+    pub source_event_id: String,
+}
+
+impl AppNotification {
+    fn from_value(value: Value, ordinal: u64) -> Option<Self> {
+        let method = value.get("method")?.as_str()?.to_owned();
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let payload = serde_json::to_vec(&params).ok()?;
+        let digest = hex_sha256(&payload);
+        Some(Self {
+            source_event_id: format!("codex:{ordinal}:{}", &digest[..16]),
+            method,
+            params,
+        })
+    }
+
+    pub fn is_approval(&self) -> bool {
+        self.method.ends_with("/requestApproval")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerRequest {
+    pub id: u64,
+    pub method: String,
+    pub params: Value,
+}
+
+pub struct CodexAppServer {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<Value>>>>>,
+    next_id: Mutex<u64>,
+    pub notifications: mpsc::Receiver<AppNotification>,
+    pub server_requests: mpsc::Receiver<ServerRequest>,
+    stderr: Arc<Mutex<VecDeque<u8>>>,
+    timeout: Duration,
+    #[cfg(windows)]
+    _job: KillOnCloseJob,
+}
+
+impl CodexAppServer {
+    pub async fn start(config: RuntimeConfig) -> Result<Self> {
+        let executable = config.validate()?;
+        let output = Command::new(&executable)
+            .arg("--version")
+            .output()
+            .await
+            .context("failed to check pinned Codex version")?;
+        let actual = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || !actual.contains(&config.expected_version) {
+            bail!("pinned Codex version does not match configured version")
+        }
+        let mut child = Command::new(executable)
+            .args(["app-server", "--stdio", "--strict-config"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start pinned Codex App Server")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("Codex App Server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Codex App Server stdout unavailable")?;
+        let stderr_reader = child
+            .stderr
+            .take()
+            .context("Codex App Server stderr unavailable")?;
+        #[cfg(windows)]
+        let job = KillOnCloseJob::assign(&child)?;
+        let pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<Value>>>>> =
+            Arc::new(Mutex::new(BTreeMap::new()));
+        let (notify_tx, notify_rx) = mpsc::channel(256);
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let stderr = Arc::new(Mutex::new(VecDeque::new()));
+        Self::spawn_stdout_reader(stdout, pending.clone(), notify_tx, request_tx);
+        Self::spawn_stderr_reader(stderr_reader, stderr.clone());
+        let server = Self {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            pending,
+            next_id: Mutex::new(1),
+            notifications: notify_rx,
+            server_requests: request_rx,
+            stderr,
+            timeout: config.request_timeout,
+            #[cfg(windows)]
+            _job: job,
+        };
+        server
+            .request(
+                "initialize",
+                json!({"clientInfo":{"name":"company-agent","version":env!("CARGO_PKG_VERSION")}}),
+            )
+            .await?;
+        server.notify("initialized", Value::Null).await?;
+        Ok(server)
+    }
+
+    fn spawn_stdout_reader(
+        stdout: tokio::process::ChildStdout,
+        pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<Value>>>>>,
+        notify: mpsc::Sender<AppNotification>,
+        requests: mpsc::Sender<ServerRequest>,
+    ) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let ordinal = AtomicU64::new(0);
+            let event_stream_id = uuid::Uuid::new_v4().to_string();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let (Some(id), Some(method)) = (
+                    value.get("id").and_then(Value::as_u64),
+                    value.get("method").and_then(Value::as_str),
+                ) {
+                    let _ = requests
+                        .send(ServerRequest {
+                            id,
+                            method: method.to_owned(),
+                            params: value.get("params").cloned().unwrap_or(Value::Null),
+                        })
+                        .await;
+                } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                    if let Some(sender) = pending.lock().await.remove(&id) {
+                        let result = if let Some(error) = value.get("error") {
+                            Err(anyhow!("Codex JSON-RPC error: {error}"))
+                        } else {
+                            Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                        };
+                        let _ = sender.send(result);
+                    }
+                } else if let Some(mut notification) =
+                    AppNotification::from_value(value, ordinal.fetch_add(1, Ordering::Relaxed) + 1)
+                {
+                    notification.source_event_id =
+                        format!("{event_stream_id}:{}", notification.source_event_id);
+                    let _ = notify.send(notification).await;
+                }
+            }
+            for (_, sender) in pending.lock().await.split_off(&0) {
+                let _ = sender.send(Err(anyhow!("Codex App Server stdout closed")));
+            }
+        });
+    }
+
+    fn spawn_stderr_reader(
+        stderr_reader: tokio::process::ChildStderr,
+        stderr: Arc<Mutex<VecDeque<u8>>>,
+    ) {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr_reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut log = stderr.lock().await;
+                log.extend(line.bytes());
+                log.push_back(b'\n');
+                while log.len() > STDERR_LIMIT {
+                    log.pop_front();
+                }
+            }
+        });
+    }
+
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if self.child.lock().await.try_wait()?.is_some() {
+            bail!("Codex App Server exited: {}", self.stderr_text().await)
+        }
+        let mut next = self.next_id.lock().await;
+        let id = *next;
+        *next += 1;
+        drop(next);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        let line = serde_json::to_string(
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )? + "\n";
+        if let Err(error) = self.stdin.lock().await.write_all(line.as_bytes()).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error.into());
+        }
+        match tokio::time::timeout(self.timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow!("Codex request receiver closed")),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!("Codex {method} timed out")
+            }
+        }
+    }
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        let mut value = json!({"jsonrpc":"2.0","method":method});
+        if !params.is_null() {
+            value["params"] = params;
+        }
+        let line = serde_json::to_string(&value)? + "\n";
+        self.stdin.lock().await.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+    pub async fn respond(&self, id: u64, result: Result<Value>) -> Result<()> {
+        let value = match result {
+            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Err(error) => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})
+            }
+        };
+        let line = serde_json::to_string(&value)? + "\n";
+        self.stdin.lock().await.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn start_thread(&self, cwd: &Path) -> Result<String> {
+        let result = self
+            .request(
+                "thread/start",
+                json!({"cwd":cwd,"approvalPolicy":"on-request","sandbox":"workspace-write"}),
+            )
+            .await?;
+        result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("thread/start did not return thread.id")
+    }
+    pub async fn start_turn(&self, thread_id: &str, cwd: &Path, prompt: &str) -> Result<String> {
+        let result = self
+            .request(
+                "turn/start",
+                json!({"threadId":thread_id,"cwd":cwd,"input":[{"type":"text","text":prompt}]}),
+            )
+            .await?;
+        result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("turn/start did not return turn.id")
+    }
+    pub async fn interrupt(&self, thread_id: &str, turn_id: &str) -> Result<()> {
+        self.request(
+            "turn/interrupt",
+            json!({"threadId":thread_id,"turnId":turn_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+    pub async fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().await.iter().copied().collect::<Vec<_>>())
+            .into_owned()
+    }
+    pub async fn is_running(&self) -> Result<bool> {
+        Ok(self.child.lock().await.try_wait()?.is_none())
+    }
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut child = self.child.lock().await;
+        if child.try_wait()?.is_none() {
+            child.kill().await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct DispatchBook {
+    active: BTreeMap<String, (String, String)>,
+}
+impl DispatchBook {
+    pub fn register(&mut self, task_id: String, thread_id: String, turn_id: String) -> bool {
+        if self.active.contains_key(&task_id) {
+            return false;
+        }
+        self.active.insert(task_id, (thread_id, turn_id));
+        true
+    }
+    pub fn interrupt_params(&self, task_id: &str) -> Option<(&str, &str)> {
+        self.active
+            .get(task_id)
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+    }
+
+    pub fn task_for_event(&self, thread_id: &str, turn_id: &str) -> Option<&str> {
+        self.active.iter().find_map(|(task_id, (thread, turn))| {
+            (thread == thread_id && (turn_id.is_empty() || turn == turn_id))
+                .then_some(task_id.as_str())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, process::Command as StdCommand};
+
+    fn compile_mock_server() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("codex-mock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("mock.rs");
+        let executable = dir.join(if cfg!(windows) {
+            "mock-codex.exe"
+        } else {
+            "mock-codex"
+        });
+        fs::write(&source, r###"
+use std::io::{self, BufRead};
+fn id(line: &str) -> u64 {
+    let marker = "\"id\":";
+    let start = line.find(marker).unwrap() + marker.len();
+    line[start..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+}
+fn main() {
+    if std::env::args().any(|arg| arg == "--version") { println!("codex-cli 0.145.0-alpha.27"); return; }
+    let mut slow = None;
+    for line in io::stdin().lock().lines() {
+        let line = line.unwrap();
+        if line.contains("\"method\":\"initialized\"") { continue; }
+        if line.contains("\"id\":900") { println!(r#"{{"jsonrpc":"2.0","method":"mock/responded","params":{{"threadId":"thread-1","turnId":"turn-1"}}}}"#); continue; }
+        let request_id = id(&line);
+        if line.contains("\"method\":\"initialize\"") { println!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, request_id); }
+        else if line.contains("\"method\":\"thread/start\"") { println!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"thread":{{"id":"thread-1"}}}}}}"#, request_id); }
+        else if line.contains("\"method\":\"turn/start\"") {
+            println!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"turn":{{"id":"turn-1"}}}}}}"#, request_id);
+            println!(r#"{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","delta":"x"}}}}"#);
+            println!(r#"{{"jsonrpc":"2.0","id":900,"method":"item/commandExecution/requestApproval","params":{{"threadId":"thread-1","turnId":"turn-1","itemId":"item-2"}}}}"#);
+        }
+        else if line.contains("\"method\":\"slow\"") { slow = Some(request_id); }
+        else if line.contains("\"method\":\"fast\"") { println!(r#"{{"jsonrpc":"2.0","id":{},"result":"fast"}}"#, request_id); if let Some(slow_id) = slow.take() { println!(r#"{{"jsonrpc":"2.0","id":{},"result":"slow"}}"#, slow_id); } }
+        else if line.contains("\"method\":\"crash\"") { std::process::exit(23); }
+        else if !line.contains("\"method\":\"timeout\"") { println!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, request_id); }
+    }
+}
+"###).unwrap();
+        let status = StdCommand::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        executable
+    }
+
+    fn mock_config(executable: PathBuf, timeout: Duration) -> RuntimeConfig {
+        RuntimeConfig {
+            executable,
+            expected_version: PINNED_PROTOCOL_VERSION.into(),
+            expected_sha256: None,
+            request_timeout: timeout,
+        }
+    }
+    #[test]
+    fn rejects_relative_and_store_runtime_paths() {
+        let config = RuntimeConfig {
+            executable: PathBuf::from("codex.exe"),
+            expected_version: PINNED_PROTOCOL_VERSION.into(),
+            expected_sha256: None,
+            request_timeout: Duration::from_secs(1),
+        };
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn notification_event_ids_are_stable_and_approval_is_detected() {
+        let value = json!({"method":"item/commandExecution/requestApproval","params":{"threadId":"t","turnId":"u","item":{"id":"i"}}});
+        let first = AppNotification::from_value(value.clone(), 1).unwrap();
+        let second = AppNotification::from_value(value, 2).unwrap();
+        assert_ne!(first.source_event_id, second.source_event_id);
+        assert!(first.is_approval());
+    }
+    #[test]
+    fn duplicate_dispatch_does_not_create_a_second_turn() {
+        let mut book = DispatchBook::default();
+        assert!(book.register("task".into(), "thread".into(), "turn".into()));
+        assert!(!book.register("task".into(), "other".into(), "other".into()));
+        assert_eq!(book.interrupt_params("task"), Some(("thread", "turn")));
+    }
+
+    #[tokio::test]
+    async fn mock_process_handles_protocol_routing_and_out_of_order_responses() {
+        let executable = compile_mock_server();
+        let mut server = CodexAppServer::start(mock_config(executable, Duration::from_secs(2)))
+            .await
+            .unwrap();
+        let cwd = std::env::temp_dir();
+        assert_eq!(server.start_thread(&cwd).await.unwrap(), "thread-1");
+        assert_eq!(
+            server.start_turn("thread-1", &cwd, "hello").await.unwrap(),
+            "turn-1"
+        );
+        let notification = server.notifications.recv().await.unwrap();
+        assert_eq!(notification.method, "item/agentMessage/delta");
+        let approval = server.server_requests.recv().await.unwrap();
+        assert_eq!(approval.id, 900);
+        server
+            .respond(approval.id, Ok(json!({"decision":"decline"})))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.notifications.recv().await.unwrap().method,
+            "mock/responded"
+        );
+        let (slow, fast) = tokio::join!(
+            server.request("slow", Value::Null),
+            server.request("fast", Value::Null)
+        );
+        assert_eq!(slow.unwrap(), json!("slow"));
+        assert_eq!(fast.unwrap(), json!("fast"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_process_reports_timeout_and_crash() {
+        let executable = compile_mock_server();
+        let server = CodexAppServer::start(mock_config(executable, Duration::from_millis(100)))
+            .await
+            .unwrap();
+        assert!(
+            server
+                .request("timeout", Value::Null)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        let _ = server.request("crash", Value::Null).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server
+                .request("after-crash", Value::Null)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exited")
+        );
+    }
+}

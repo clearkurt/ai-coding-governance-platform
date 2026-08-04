@@ -30,7 +30,7 @@ def seeded_store():
     store.devices[device_a.id], store.devices[device_b.id] = device_a, device_b
     store.credentials[hash_secret("device-a-secret")] = (device_a.id, utcnow() + timedelta(hours=1), None)
     store.credentials[hash_secret("device-b-secret")] = (device_b.id, utcnow() + timedelta(hours=1), None)
-    store.projects[project_a], store.projects[project_b] = (team_a, device_a.id), (team_b, device_b.id)
+    store.projects[project_a], store.projects[project_b] = (team_a, device_a.id, "root-a"), (team_b, device_b.id, "root-b")
     store.conversations[conversation_a], store.conversations[conversation_b] = team_a, team_b
     store.grants.add((user_a.id, project_a))
     return store, user_a, user_b, device_a, device_b, project_a, project_b, conversation_a, conversation_b
@@ -75,9 +75,9 @@ def test_login_and_expired_session_are_checked(client, seeded_store):
 def test_cross_team_task_is_rejected_and_requests_are_idempotent(client, seeded_store):
     store, user, _, device_a, device_b, project_a, project_b, conversation_a, conversation_b = seeded_store
     headers = session_headers(store, user)
-    cross_team = client.post("/tasks", headers=headers, json={"device_id": str(device_b.id), "project_id": str(project_b), "conversation_id": str(conversation_b), "idempotency_key": "same"})
+    cross_team = client.post("/tasks", headers=headers, json={"device_id": str(device_b.id), "project_id": str(project_b), "conversation_id": str(conversation_b), "idempotency_key": "same", "prompt": "cross-team"})
     assert cross_team.status_code == 403
-    body = {"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "same"}
+    body = {"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "same", "prompt": "implement the task"}
     first, second = client.post("/tasks", headers=headers, json=body), client.post("/tasks", headers=headers, json=body)
     assert first.status_code == 201 and second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
@@ -86,7 +86,7 @@ def test_cross_team_task_is_rejected_and_requests_are_idempotent(client, seeded_
 def test_device_websocket_auth_event_deduplication_and_sse_replay(client, seeded_store):
     store, user, _, device_a, _, project_a, _, conversation_a, _ = seeded_store
     headers = session_headers(store, user)
-    task = client.post("/tasks", headers=headers, json={"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "stream"}).json()
+    task = client.post("/tasks", headers=headers, json={"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "stream", "prompt": "stream this task"}).json()
     with client.websocket_connect("/ws/devices") as socket:
         socket.send_json({"type": "authenticate", "device_id": str(device_a.id), "credential": "device-a-secret", "runtime_version": "1.0"})
         assert socket.receive_json()["type"] == "authenticated"
@@ -122,16 +122,17 @@ def test_connected_device_receives_new_task_dispatch(client, seeded_store):
     with client.websocket_connect("/ws/devices") as socket:
         socket.send_json({"type": "authenticate", "device_id": str(device_a.id), "credential": "device-a-secret"})
         assert socket.receive_json()["type"] == "authenticated"
-        response = client.post("/tasks", headers=headers, json={"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "live-dispatch"})
+        response = client.post("/tasks", headers=headers, json={"device_id": str(device_a.id), "project_id": str(project_a), "conversation_id": str(conversation_a), "idempotency_key": "live-dispatch", "prompt": "live dispatch prompt"})
         assert response.status_code == 201
         dispatch = socket.receive_json()
         assert dispatch["type"] == "task.dispatch" and dispatch["task_id"] == response.json()["id"]
+        assert dispatch["root_id"] == "root-a" and dispatch["prompt"] == "live dispatch prompt"
 
 
 @pytest.mark.asyncio
 async def test_sse_follows_event_that_arrives_after_subscription(seeded_store):
     store, user, _, device_a, _, project_a, _, conversation_a, _ = seeded_store
-    task, _ = await store.create_task(user, device_a.id, project_a, conversation_a, "follow")
+    task, _ = await store.create_task(user, device_a.id, project_a, conversation_a, "follow", "follow prompt")
     stream = replay_and_follow(store, task, 0, poll_interval=0.01)
     pending = asyncio.create_task(anext(stream))
     await asyncio.sleep(0.02)

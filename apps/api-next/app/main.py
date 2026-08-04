@@ -27,7 +27,7 @@ app.state.device_registry = DeviceConnectionRegistry()
 
 
 def task_out(task) -> TaskOut:
-    return TaskOut(id=task.id, team_id=task.team_id, device_id=task.device_id, project_id=task.project_id, conversation_id=task.conversation_id, status=task.status)
+    return TaskOut(id=task.id, team_id=task.team_id, device_id=task.device_id, project_id=task.project_id, conversation_id=task.conversation_id, root_id=task.root_id, status=task.status)
 
 
 @app.get("/health/live", tags=["health"])
@@ -77,7 +77,7 @@ async def me(user: UserIdentity = Depends(current_user)) -> CurrentUser:
 @app.post("/tasks", response_model=TaskOut)
 async def create_task(body: CreateTaskRequest, response: Response, user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)) -> TaskOut:
     try:
-        task, created = await store.create_task(user, body.device_id, body.project_id, body.conversation_id, body.idempotency_key)
+        task, created = await store.create_task(user, body.device_id, body.project_id, body.conversation_id, body.idempotency_key, body.prompt)
     except PermissionError as error:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="project, device, or conversation is not available") from error
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK

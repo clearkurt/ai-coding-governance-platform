@@ -28,3 +28,18 @@ company-agent.exe run
 配对时会弹出目录选择窗口；Agent 凭据保存到 Windows Credential Manager，配置文件不保存明文凭据。
 
 `ws://` 只允许 `localhost`/`127.0.0.1`，内网部署必须使用 `wss://`。
+
+## Codex App Server 模式
+
+新模式只接受产品分发的固定 Codex 可执行文件绝对路径，不从 `PATH` 或 WindowsApps 商店目录启动。配置前可同时提供发布清单中的 SHA-256：
+
+```powershell
+company-agent.exe configure-codex --executable C:\ProgramData\CompanyAgent\runtime\codex.exe --sha256 <发布哈希>
+company-agent.exe run
+```
+
+守护进程会校验固定版本，通过 `app-server --stdio --strict-config` 启动子进程，并用 Windows Job Object 保证退出时终止整个进程树。任务中的 `root_id` 必须匹配配对时授权的根目录。需要临时回退旧执行器时运行：
+
+```powershell
+company-agent.exe use-legacy
+```

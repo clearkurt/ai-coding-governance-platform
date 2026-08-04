@@ -37,6 +37,8 @@ class DeviceConnectionRegistry:
             "task_id": str(task.id),
             "project_id": str(task.project_id),
             "conversation_id": str(task.conversation_id),
+            "root_id": task.root_id,
+            "prompt": task.prompt,
             "delivery_id": task.delivery_id,
         })
         return True

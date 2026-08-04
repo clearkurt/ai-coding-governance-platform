@@ -35,6 +35,8 @@ class TaskIdentity:
     device_id: uuid.UUID
     project_id: uuid.UUID
     conversation_id: uuid.UUID
+    root_id: str
+    prompt: str
     status: str
     delivery_id: str
 
@@ -56,7 +58,7 @@ class Store(Protocol):
     async def authenticate_device(self, device_id: uuid.UUID, credential: str) -> DeviceIdentity | None: ...
     async def touch_device(self, device: DeviceIdentity, runtime_version: str | None) -> None: ...
     async def create_task(
-        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str
+        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str, prompt: str
     ) -> tuple[TaskIdentity, bool]: ...
     async def get_task_for_user(self, task_id: uuid.UUID, user: UserIdentity) -> TaskIdentity | None: ...
     async def append_event(self, device: DeviceIdentity, task_id: uuid.UUID, source_event_id: str, event_type: str, payload: dict[str, object]) -> PersistedEvent: ...
@@ -81,7 +83,7 @@ class PostgresStore:
 
     @staticmethod
     def _task(model: Task) -> TaskIdentity:
-        return TaskIdentity(model.id, model.team_id, model.device_id, model.project_id, model.conversation_id, model.status.value, model.delivery_id)
+        return TaskIdentity(model.id, model.team_id, model.device_id, model.project_id, model.conversation_id, model.root_id, model.prompt, model.status.value, model.delivery_id)
 
     async def find_user(self, team_id: uuid.UUID, email: str) -> UserIdentity | None:
         model = await self.session.scalar(select(User).where(User.team_id == team_id, User.email == email))
@@ -131,7 +133,7 @@ class PostgresStore:
         await self.session.commit()
 
     async def create_task(
-        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str
+        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str, prompt: str
     ) -> tuple[TaskIdentity, bool]:
         device = await self.session.get(Device, device_id)
         project = await self.session.get(Project, project_id)
@@ -148,7 +150,7 @@ class PostgresStore:
         )
         if existing:
             return self._task(existing), False
-        model = Task(team_id=user.team_id, device_id=device_id, project_id=project_id, conversation_id=conversation_id, idempotency_key=idempotency_key)
+        model = Task(team_id=user.team_id, device_id=device_id, project_id=project_id, conversation_id=conversation_id, root_id=project.root_id, prompt=prompt, idempotency_key=idempotency_key)
         self.session.add(model)
         await self.session.commit()
         return self._task(model), True
@@ -207,7 +209,7 @@ class MemoryStore:
     devices: dict[uuid.UUID, DeviceIdentity] = field(default_factory=dict)
     credentials: dict[str, tuple[uuid.UUID, datetime | None, datetime | None]] = field(default_factory=dict)
     grants: set[tuple[uuid.UUID, uuid.UUID]] = field(default_factory=set)
-    projects: dict[uuid.UUID, tuple[uuid.UUID, uuid.UUID]] = field(default_factory=dict)
+    projects: dict[uuid.UUID, tuple[uuid.UUID, uuid.UUID, str]] = field(default_factory=dict)
     conversations: dict[uuid.UUID, uuid.UUID] = field(default_factory=dict)
     tasks: dict[uuid.UUID, TaskIdentity] = field(default_factory=dict)
     idempotency: dict[tuple[uuid.UUID, uuid.UUID, str], uuid.UUID] = field(default_factory=dict)
@@ -240,18 +242,18 @@ class MemoryStore:
     async def touch_device(self, device: DeviceIdentity, runtime_version: str | None) -> None:
         return None
 
-    async def create_task(self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str) -> tuple[TaskIdentity, bool]:
+    async def create_task(self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID, idempotency_key: str, prompt: str) -> tuple[TaskIdentity, bool]:
         device = self.devices.get(device_id)
         project = self.projects.get(project_id)
         if not device or not project or self.conversations.get(conversation_id) != user.team_id or (user.id, project_id) not in self.grants:
             raise PermissionError("resource is not available to this team member")
-        if device.team_id != user.team_id or project != (user.team_id, device_id):
+        if device.team_id != user.team_id or project[:2] != (user.team_id, device_id):
             raise PermissionError("cross-team or cross-device task request")
         key = (user.team_id, device_id, idempotency_key)
         if key in self.idempotency:
             return self.tasks[self.idempotency[key]], False
         task_id = uuid.uuid4()
-        task = TaskIdentity(task_id, user.team_id, device_id, project_id, conversation_id, TaskStatus.pending.value, str(task_id))
+        task = TaskIdentity(task_id, user.team_id, device_id, project_id, conversation_id, project[2], prompt, TaskStatus.pending.value, str(task_id))
         self.tasks[task.id] = task
         self.idempotency[key] = task.id
         return task, True
