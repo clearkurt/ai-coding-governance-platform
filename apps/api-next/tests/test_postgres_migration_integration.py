@@ -10,7 +10,7 @@ import sys
 import tempfile
 import uuid
 from datetime import timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import quote, unquote, urlencode
 
 import pytest
@@ -117,6 +117,38 @@ def _assert_control_plane_schema(snapshot: tuple[set[str], int, int, set[str]]) 
     assert task_status_values == EXPECTED_TASK_STATUSES
 
 
+def _windows_path_to_wsl(wsl: str, path: Path) -> str:
+    windows_path = PureWindowsPath(path.resolve()).as_posix()
+    try:
+        result = subprocess.run(
+            [wsl, "-d", "Ubuntu-24.04", "--", "wslpath", "-a", windows_path],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        raise AssertionError("wslpath failed to convert a temporary TLS path") from None
+    converted = result.stdout.decode("utf-8", errors="replace").strip()
+    if not converted.startswith("/"):
+        raise AssertionError("wslpath returned an invalid temporary TLS path")
+    return converted
+
+
+def _run_openssl(wsl: str, arguments: list[str]) -> None:
+    try:
+        subprocess.run(
+            [wsl, "-d", "Ubuntu-24.04", "--", "openssl", *arguments],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError("temporary TLS certificate generation timed out") from None
+    except subprocess.CalledProcessError:
+        raise AssertionError("temporary TLS certificate generation failed") from None
+
+
 def test_postgres_identifier_quoting_escapes_role_names() -> None:
     assert _quote_identifier('admin"name') == '"admin""name"'
     with pytest.raises(ValueError):
@@ -202,6 +234,43 @@ def test_control_plane_schema_contract_is_a_typed_tuple() -> None:
     tables = {"alembic_version", *required_tables, *(f"table_{index}" for index in range(13))}
 
     _assert_control_plane_schema((tables, 21, 26, EXPECTED_TASK_STATUSES))
+
+
+def test_windows_path_to_wsl_uses_single_forward_slash_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    observed: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        observed.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"/mnt/c/temp/with space/server.key\n", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    windows_path = Path(r"C:\Temp Folder\TLS Files\server.key")
+
+    assert _windows_path_to_wsl("wsl.exe", windows_path) == "/mnt/c/temp/with space/server.key"
+    assert observed[0][-1].endswith("C:/Temp Folder/TLS Files/server.key")
+    assert "\\" not in observed[0][-1]
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (subprocess.CompletedProcess([], 0, stdout=b"\xff\xfe", stderr=b"private output"), "invalid"),
+        (subprocess.CalledProcessError(1, [], stderr=b"private output"), "failed"),
+    ],
+)
+def test_windows_path_to_wsl_rejects_unsafe_output(
+    monkeypatch: pytest.MonkeyPatch, result: subprocess.CompletedProcess[bytes] | Exception, message: str
+) -> None:
+    def fake_run(*_args, **_kwargs):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AssertionError, match=message) as error:
+        _windows_path_to_wsl("wsl.exe", Path(r"C:\private\server.key"))
+    assert "private" not in str(error.value)
 
 
 @pytest.fixture
@@ -761,15 +830,6 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
         extension = tls_directory / "server.ext"
         extension.write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", encoding="utf-8")
 
-        def wsl_path(path: Path) -> str:
-            result = subprocess.run(
-                [wsl, "-d", "Ubuntu-24.04", "--", "wslpath", "-a", str(path)],
-                capture_output=True,
-                check=True,
-                timeout=15,
-            )
-            return result.stdout.decode("utf-8", errors="strict").strip()
-
         ca_key, ca_certificate = tls_directory / "ca.key", tls_directory / "ca.crt"
         server_key, server_request = tls_directory / "server.key", tls_directory / "server.csr"
         server_certificate = tls_directory / "server.crt"
@@ -781,9 +841,9 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
                 "rsa:2048",
                 "-nodes",
                 "-keyout",
-                wsl_path(ca_key),
+                _windows_path_to_wsl(wsl, ca_key),
                 "-out",
-                wsl_path(ca_certificate),
+                _windows_path_to_wsl(wsl, ca_certificate),
                 "-days",
                 "1",
                 "-sha256",
@@ -796,9 +856,9 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
                 "rsa:2048",
                 "-nodes",
                 "-keyout",
-                wsl_path(server_key),
+                _windows_path_to_wsl(wsl, server_key),
                 "-out",
-                wsl_path(server_request),
+                _windows_path_to_wsl(wsl, server_request),
                 "-sha256",
                 "-subj",
                 "/CN=127.0.0.1",
@@ -807,29 +867,23 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
                 "x509",
                 "-req",
                 "-in",
-                wsl_path(server_request),
+                _windows_path_to_wsl(wsl, server_request),
                 "-CA",
-                wsl_path(ca_certificate),
+                _windows_path_to_wsl(wsl, ca_certificate),
                 "-CAkey",
-                wsl_path(ca_key),
+                _windows_path_to_wsl(wsl, ca_key),
                 "-CAcreateserial",
                 "-out",
-                wsl_path(server_certificate),
+                _windows_path_to_wsl(wsl, server_certificate),
                 "-days",
                 "1",
                 "-sha256",
                 "-extfile",
-                wsl_path(extension),
+                _windows_path_to_wsl(wsl, extension),
             ],
         ]
         for arguments in commands:
-            subprocess.run(
-                [wsl, "-d", "Ubuntu-24.04", "--", "openssl", *arguments],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                check=True,
-                timeout=30,
-            )
+            _run_openssl(wsl, arguments)
         asyncio.run(exercise(server_certificate, server_key, ca_certificate))
 
 
