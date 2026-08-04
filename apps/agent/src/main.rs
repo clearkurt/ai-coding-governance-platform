@@ -1,5 +1,6 @@
 mod backup;
 mod codex_bridge;
+mod durable_outbox;
 mod protocol;
 mod sandbox;
 mod workspace;
@@ -399,11 +400,16 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
     };
     let daemon_instance = uuid::Uuid::new_v4().to_string();
     let active_path = active_task_path()?;
+    let mut outbox = durable_outbox::DurableOutbox::load(data_dir.join("event-outbox.json"))?;
     // A fresh daemon instance never inherits a previous process's task lease.
     if let Some(stale) = read_active_task(&active_path)? {
         if process_is_alive(stale.daemon_pid) {
             bail!("another company-agent process owns the active Codex task lease")
         }
+        outbox.ensure_recovery_failure(
+            &stale.task_id,
+            "daemon stopped before the task reached a terminal event",
+        )?;
         clear_active_task(&active_path, &stale.task_id)?;
     }
     let stale_workspaces = data_dir.join("task-workspaces");
@@ -412,7 +418,6 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
     }
     fs::create_dir_all(&stale_workspaces)?;
     let mut retry = Duration::from_secs(1);
-    let mut outbox = BTreeMap::new();
     let mut workspaces: BTreeMap<String, workspace::ShadowWorkspace> = BTreeMap::new();
     loop {
         match codex_bridge::CodexAppServer::start(runtime.clone()).await {
@@ -437,6 +442,11 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 let _ = bridge.shutdown().await;
+                persist_unfinished_tasks(
+                    &book,
+                    &mut outbox,
+                    "Codex App Server stopped before the task reached a terminal event",
+                )?;
                 workspace::cleanup_all(&mut workspaces)?;
                 clear_instance_active_task(&active_path, &daemon_instance)?;
             }
@@ -445,6 +455,17 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
         tokio::time::sleep(retry).await;
         retry = (retry * 2).min(Duration::from_secs(60));
     }
+}
+
+fn persist_unfinished_tasks(
+    book: &codex_bridge::DispatchBook,
+    outbox: &mut durable_outbox::DurableOutbox,
+    reason: &str,
+) -> Result<()> {
+    for task_id in book.task_ids() {
+        outbox.ensure_recovery_failure(task_id, reason)?;
+    }
+    Ok(())
 }
 
 async fn send_json<S>(write: &mut S, value: serde_json::Value) -> Result<()>
@@ -460,7 +481,7 @@ where
 
 async fn send_audit_event<S>(
     write: &mut S,
-    outbox: &mut BTreeMap<String, serde_json::Value>,
+    outbox: &mut durable_outbox::DurableOutbox,
     task_id: &str,
     event_type: &str,
     payload: serde_json::Value,
@@ -472,7 +493,19 @@ where
     let source_event_id = format!("agent:{}", uuid::Uuid::new_v4());
     let payload = workspace::sanitize_audit(payload);
     let event = serde_json::json!({"type":"task.event","task_id":task_id,"source_event_id":source_event_id,"event_type":event_type,"payload":payload});
-    outbox.insert(source_event_id, event.clone());
+    persist_then_send(write, outbox, event).await
+}
+
+async fn persist_then_send<S>(
+    write: &mut S,
+    outbox: &mut durable_outbox::DurableOutbox,
+    event: serde_json::Value,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    outbox.insert(event.clone())?;
     send_json(write, event).await
 }
 
@@ -482,7 +515,7 @@ async fn run_codex_connection(
     daemon_instance: &str,
     bridge: &mut codex_bridge::CodexAppServer,
     book: &mut codex_bridge::DispatchBook,
-    outbox: &mut BTreeMap<String, serde_json::Value>,
+    outbox: &mut durable_outbox::DurableOutbox,
     workspaces: &mut BTreeMap<String, workspace::ShadowWorkspace>,
 ) -> Result<()> {
     let active_path = active_task_path()?;
@@ -537,8 +570,8 @@ async fn run_codex_connection(
                         }
                     }
                 }
-                if let Some((audit_type,audit_payload))=sync_audit { send_audit_event(&mut write,outbox,&task_id,audit_type,audit_payload).await?; }
                 let source_event_id = notification.source_event_id.clone();
+                let terminal = is_terminal_turn_event(&event_type);
                 let event = serde_json::json!({
                     "type":"task.event",
                     "task_id":task_id,
@@ -546,17 +579,19 @@ async fn run_codex_connection(
                     "event_type":event_type,
                     "payload":payload,
                 });
-                outbox.insert(source_event_id, event.clone());
-                send_json(&mut write, event).await?;
-                if is_terminal_turn_event(&notification.method) {
+                outbox.insert(event.clone())?;
+                if terminal {
                     clear_active_task(&active_path, &task_id)?;
                     book.remove(&task_id);
                     if let Some(shadow) = workspaces.remove(&task_id) { let _ = shadow.remove(); }
                     // Command-auth tokens are cached per provider. Restarting the pinned
                     // App Server at each task boundary guarantees no task reuses one.
                     bridge.shutdown().await?;
+                    if let Some((audit_type,audit_payload))=sync_audit { send_audit_event(&mut write,outbox,&task_id,audit_type,audit_payload).await?; }
+                    send_json(&mut write, event).await?;
                     bail!("Codex task reached terminal state; rotating task-bound model authentication")
                 }
+                send_json(&mut write, event).await?;
             }
             request = bridge.server_requests.recv() => {
                 let request = request.context("Codex server request stream closed")?;
@@ -570,7 +605,7 @@ async fn run_codex_connection(
                     bridge.respond(request.id, Err(anyhow::anyhow!("approval request workspace is unavailable"))).await?;
                     continue;
                 };
-                let source_event_id = format!("codex-request:{}", request.id);
+                let source_event_id = format!("codex-request:{task_id}:{}", request.id);
                 let event = serde_json::json!({
                     "type":"task.event",
                     "task_id":task_id,
@@ -578,7 +613,7 @@ async fn run_codex_connection(
                     "event_type":request.method,
                     "payload":{"request_id":request.id,"params":workspace::sanitize_event(request.params, &shadow.path, shadow.real_root())},
                 });
-                outbox.insert(source_event_id, event.clone());
+                outbox.insert(event.clone())?;
                 send_json(&mut write, event).await?;
             }
             message = read.next() => {
@@ -590,7 +625,7 @@ async fn run_codex_connection(
                 match value["type"].as_str().unwrap_or("") {
                     "heartbeat.ack" | "task.dispatch.acknowledged" => {}
                     "task.event.ack" => {
-                        if let Some(source) = value["source_event_id"].as_str() { outbox.remove(source); }
+                        if let Some(source) = value["source_event_id"].as_str() { outbox.remove(source)?; }
                     }
                     "task.dispatch" => {
                         let task_id = value["task_id"].as_str().context("dispatch missing task_id")?;
@@ -961,6 +996,38 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    struct FailingSink;
+    impl futures_util::Sink<Message> for FailingSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected socket failure",
+            )))
+        }
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            unreachable!("poll_ready always fails")
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn main_source_contains_no_known_mojibake_markers() {
         let source = include_str!("main.rs");
@@ -1055,6 +1122,64 @@ mod tests {
         assert!(read_active_task(&path).unwrap().is_none());
         assert!(!active_task_lock_path(&path).exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bridge_crash_persists_failure_but_normal_terminal_does_not() {
+        let dir = std::env::temp_dir().join(format!("agent-outbox-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("event-outbox.json");
+        let mut outbox = durable_outbox::DurableOutbox::load(path.clone()).unwrap();
+        let mut book = codex_bridge::DispatchBook::default();
+        book.register("crashed".into(), "thread".into(), "turn".into());
+        persist_unfinished_tasks(&book, &mut outbox, "bridge crashed").unwrap();
+        assert!(outbox.has_terminal("crashed"));
+
+        let mut normal = codex_bridge::DispatchBook::default();
+        normal.register("completed".into(), "thread".into(), "turn".into());
+        outbox
+            .insert(json!({"type":"task.event","task_id":"completed","source_event_id":"completed-event","event_type":"turn/completed","payload":{}}))
+            .unwrap();
+        normal.remove("completed");
+        persist_unfinished_tasks(&normal, &mut outbox, "bridge stopped").unwrap();
+        assert_eq!(
+            outbox
+                .values()
+                .filter(|event| event["task_id"] == "completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            durable_outbox::DurableOutbox::load(path)
+                .unwrap()
+                .values()
+                .filter(|event| event["task_id"] == "crashed")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_socket_send_leaves_event_in_durable_outbox() {
+        let dir = std::env::temp_dir().join(format!("agent-outbox-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("event-outbox.json");
+        let mut outbox = durable_outbox::DurableOutbox::load(path.clone()).unwrap();
+        let mut sink = FailingSink;
+        let event = json!({"type":"task.event","task_id":"task","source_event_id":"send-fails","event_type":"text.delta","payload":{}});
+        assert!(
+            persist_then_send(&mut sink, &mut outbox, event)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            durable_outbox::DurableOutbox::load(path)
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()["source_event_id"],
+            "send-fails"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

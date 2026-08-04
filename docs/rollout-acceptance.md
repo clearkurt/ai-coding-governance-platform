@@ -10,12 +10,14 @@
 |---|---|
 | FastAPI | 普通 `pytest` 24 项通过、2 项真实 PostgreSQL integration 默认 skipped；migration 与 `PostgresStore` lifecycle integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
-| Rust daemon | `cargo test` 43 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
+| Rust daemon | `cargo test` 51 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
 | 旧链路 | 根目录 legacy build 与 smoke test 通过 |
 | 依赖审计 | `npm audit` 0 个漏洞 |
 
 这些结果证明当前代码的自动化契约，不等同于生产就绪。
+
+Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable outbox 中持久化；WSS 重连按稳定 key 顺序重发，只有中央 ACK 成功后才持久删除。daemon 或 App Server 在活动任务期间异常退出时，会在没有既存 terminal 事件的前提下持久化确定性的 `turn/failed` 恢复事件，避免中央任务永久停在 running；已落盘但 ACK 丢失的 terminal 事件优先，不会被 synthetic failure 覆盖。该保证覆盖进程退出、App Server 崩溃和连接发送失败；临时文件会 `sync_all`，但当前未对父目录执行目录级同步，且 Windows 文件替换语义有限，因此不宣称突然断电后的目录元数据一定持久。
 
 ## 尚未验证的生产门槛
 
@@ -24,6 +26,7 @@
 - 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端模型任务、审批、取消、同步和回滚。真实 artifact 的安装与 App Server 初始化 smoke 已通过，但不能替代完整任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。
 - 完成小规模设备灰度、故障注入和长任务测试，包括进程崩溃、网络抖动、服务重启、磁盘不足、并发冲突和审计重放。
+- Durable outbox 仍是单机本地文件，不替代磁盘损坏、磁盘耗尽、设备丢失或跨设备复制测试；达到条数/单事件/总量上限时 daemon 会拒绝继续假装成功，需要运维介入并保留旧链路。
 
 任一项未完成时，不得删除旧路径、移除 `UseLegacy` 或把根 package scripts/生产流量切到目标链路。
 

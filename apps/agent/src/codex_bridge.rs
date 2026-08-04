@@ -605,6 +605,9 @@ impl DispatchBook {
     pub fn remove(&mut self, task_id: &str) -> bool {
         self.active.remove(task_id).is_some()
     }
+    pub fn task_ids(&self) -> impl Iterator<Item = &str> {
+        self.active.keys().map(String::as_str)
+    }
 }
 
 #[cfg(test)]
