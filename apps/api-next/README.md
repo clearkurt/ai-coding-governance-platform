@@ -41,6 +41,8 @@ Production configuration is fail-closed at settings construction and therefore a
 
 Production defaults `COMPANY_AGENT_CODEX_ROLLOUT_MODE=disabled`. `allowlist` accepts new tasks only for UUIDs in the JSON array `COMPANY_AGENT_CODEX_ROLLOUT_DEVICE_IDS`; `all` is an explicit high-risk choice. The gate affects only new task creation, never recovery of existing work. The release check reports the mode but not device IDs. See [codex-rollout-control.md](../../docs/codex-rollout-control.md).
 
+`python -m app.rollout_report --window-hours 24 --stale-hours 2` emits stable read-only JSON for rollout evidence. It reports aggregate task states and terminal ratios, stale active tasks, unacknowledged task/approval/rollback deliveries, selected failure audits, model usage totals, event-sequence gaps, and terminal tasks without a terminal event. Optional `--team <uuid>` scopes queries without emitting the UUID. It never loads or outputs prompts, payloads, audit metadata, emails, resource identifiers, tokens, paths, or database URLs, and it does not apply thresholds or change rollout mode.
+
 Run the offline preflight before migrations or process startup:
 
 ```powershell

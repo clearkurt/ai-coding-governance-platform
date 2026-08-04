@@ -15,3 +15,5 @@ The gate appears only in `POST /tasks`. Switching to `disabled` does not block p
 The real PostgreSQL integration creates a pending task, changes production configuration to `disabled`, reconstructs a fresh session/store, and verifies that the identical task and delivery still replay. This proves the local persistence contract, not a real-device gray rollout.
 
 Recommended rollout is `disabled`, then a small reviewed `allowlist`, then larger reviewed batches. Use `all` only through a separate approved production change. For emergency rollback, return to `disabled`, retain pending records and audit evidence, and let recovery/ACK paths finish; do not revoke device credentials merely to stop new work.
+
+Before and after every allowlist change, retain `python -m app.rollout_report --window-hours 24 --stale-hours 2` output as reviewed JSON evidence. Use `--team <uuid>` only for scoped investigation; the report states that filtering was applied but does not emit the UUID. The CLI embeds no release thresholds and never changes traffic or configuration.
