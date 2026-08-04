@@ -8,7 +8,7 @@
 
 | 范围 | 结果 |
 |---|---|
-| FastAPI | 普通 `pytest` 24 项通过、2 项真实 PostgreSQL integration 默认 skipped；migration 与 `PostgresStore` lifecycle integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
+| FastAPI | 普通 `pytest` 29 项通过、2 项真实 PostgreSQL integration 默认 skipped；migration 与 `PostgresStore` lifecycle integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
 | Rust daemon | `cargo test` 51 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
@@ -16,6 +16,8 @@
 | 依赖审计 | `npm audit` 0 个漏洞 |
 
 这些结果证明当前代码的自动化契约，不等同于生产就绪。
+
+Responses 流代理已用本地故障流验证：首块后 timeout/read error、下游首次迭代前断开、响应体从未启动、部分消费任务取消，都会幂等关闭上游并精确释放并发槽；只有解析到完整 `response.completed` 才记录一次用量。建立上游连接或非流响应读取阶段的 timeout/HTTP 错误仍映射为 504/502；流式响应 headers 已发送后的中途错误只能中止流，不能再伪装成 HTTP 504。
 
 Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable outbox 中持久化；WSS 重连按稳定 key 顺序重发，只有中央 ACK 成功后才持久删除。daemon 或 App Server 在活动任务期间异常退出时，会在没有既存 terminal 事件的前提下持久化确定性的 `turn/failed` 恢复事件，避免中央任务永久停在 running；已落盘但 ACK 丢失的 terminal 事件优先，不会被 synthetic failure 覆盖。该保证覆盖进程退出、App Server 崩溃和连接发送失败；临时文件会 `sync_all`，但当前未对父目录执行目录级同步，且 Windows 文件替换语义有限，因此不宣称突然断电后的目录元数据一定持久。
 

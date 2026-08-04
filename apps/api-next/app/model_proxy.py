@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.dependencies import get_store
 from app.settings import get_settings
@@ -135,9 +136,26 @@ async def proxy_responses(
             pass
         return Response(content, status_code=upstream.status_code, headers=response_headers)
 
+    cleanup_lock = asyncio.Lock()
+    cleaned_up = False
+    usage_record: tuple[str, int, int] | None = None
+
+    async def cleanup() -> None:
+        nonlocal cleaned_up
+        async with cleanup_lock:
+            if cleaned_up:
+                return
+            cleaned_up = True
+            try:
+                await upstream.aclose()
+            finally:
+                _semaphore.release()
+            if usage_record:
+                await store.record_model_usage(auth, *usage_record)
+
     async def stream() -> AsyncIterator[bytes]:
+        nonlocal usage_record
         buffer = b""
-        usage_record: tuple[str, int, int] | None = None
         try:
             async for chunk in upstream.aiter_raw():
                 if await request.is_disconnected():
@@ -167,9 +185,11 @@ async def proxy_responses(
                             usage_record = (provider_id, input_tokens, output_tokens)
                 except (ValueError, TypeError):
                     pass
-            await upstream.aclose()
-            _semaphore.release()
-            if usage_record:
-                await store.record_model_usage(auth, *usage_record)
+            await cleanup()
 
-    return StreamingResponse(stream(), status_code=upstream.status_code, headers=response_headers)
+    return StreamingResponse(
+        stream(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(cleanup),
+    )
