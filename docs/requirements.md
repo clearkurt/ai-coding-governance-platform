@@ -1,5 +1,9 @@
 # 企业内部 AI 编程助手：LLM Agent 重构需求
 
+> 本文主体描述当前已实现的自研 Agent 方向。项目已经确认转向 Codex App Server + DeepSeek Responses API 目标架构；新需求以 [codex-deepseek-target.md](codex-deepseek-target.md) 为优先依据，本文保留用于迁移对照。
+
+目标应用技术栈已确定为 Vue 3 前端、FastAPI 中央 API 和 PostgreSQL 数据库，不要求复用本文所对应的旧实现技术栈。
+
 ## 目标
 
 平台升级为“服务端 LLM Agent + 本地受控工具”的架构。LLM 运行在服务端或公司内网模型网关，不部署在 Windows Agent 中；源码访问和文件修改仍由本地 Agent 执行。
