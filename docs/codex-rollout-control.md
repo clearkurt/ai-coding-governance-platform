@@ -1,6 +1,6 @@
 # Codex rollout control
 
-Status: the gate and its PostgreSQL recovery behavior have passed local automated integration. Production cohort selection and observation remain release activities.
+Status: the gate, PostgreSQL recovery behavior, and read-only rollout report have passed local automated integration. Production cohort selection and observation remain release activities.
 
 The central FastAPI control plane has a production-only, fail-closed gate for creation of new Codex tasks. It does not switch the default application entry point or remove the legacy rollback path.
 
@@ -17,3 +17,5 @@ The real PostgreSQL integration creates a pending task, changes production confi
 Recommended rollout is `disabled`, then a small reviewed `allowlist`, then larger reviewed batches. Use `all` only through a separate approved production change. For emergency rollback, return to `disabled`, retain pending records and audit evidence, and let recovery/ACK paths finish; do not revoke device credentials merely to stop new work.
 
 Before and after every allowlist change, retain `python -m app.rollout_report --window-hours 24 --stale-hours 2` output as reviewed JSON evidence. Use `--team <uuid>` only for scoped investigation; the report states that filtering was applied but does not emit the UUID. The CLI embeds no release thresholds and never changes traffic or configuration.
+
+The report integration seeds two isolated teams and verifies task-state ratios, stale approval work, all three unacknowledged delivery classes, selected failure audits, model usage, event-sequence gaps, missing terminal events, time-window exclusion, and team filtering against real PostgreSQL. A sensitive canary in names, prompts and event payloads must not appear in the serialized report.
