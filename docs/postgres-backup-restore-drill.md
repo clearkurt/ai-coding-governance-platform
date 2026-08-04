@@ -1,6 +1,6 @@
 # PostgreSQL backup and restore drill
 
-Status: automated and environment-gated. PostgreSQL 16.14 `pg_dump` and `pg_restore` are available through WSL on this machine, but the drill has not yet passed on this checkout because this task environment does not provide `COMPANY_AGENT_TEST_POSTGRES_ADMIN_URL`.
+Status: automated, environment-gated, and passed on this checkout against local PostgreSQL 16 with PostgreSQL 16.14 `pg_dump` and `pg_restore` through WSL. This local result does not replace a production-matched restore drill or retained release evidence.
 
 The integration test `test_postgres_custom_backup_restore_preserves_pending_control_plane_state` is the local control-plane recovery drill. It deliberately creates random source and target databases and login roles; it never dumps, restores, drops, or changes a named application database. Cleanup terminates connections to the random target database and removes both databases and roles in `finally` paths.
 
