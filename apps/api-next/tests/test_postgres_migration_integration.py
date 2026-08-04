@@ -16,14 +16,15 @@ from urllib.parse import quote, unquote, urlencode
 import pytest
 from alembic.config import Config
 from asyncpg import PostgresError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from alembic import command
-from app.db.models import TaskEvent, Team, User
+from app.db.models import AuditEvent, Task, TaskEvent, TaskStatus, Team, User
 from app.device_registry import DeviceConnectionRegistry
 from app.main import app, websocket_store
+from app.rollout_report import collect_report
 from app.security import utcnow
 from app.settings import Settings
 from app.store import PostgresStore
@@ -925,6 +926,146 @@ def test_postgres_rollout_disable_preserves_pending_delivery(migrated_postgres_u
             async with sessions() as session:
                 pending = await PostgresStore(session).pending_tasks_for_device(device)
                 assert [(item.id, item.delivery_id) for item in pending] == [(task.id, task.delivery_id)]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_postgres_rollout_report_aggregates_and_filters_without_sensitive_data(
+    migrated_postgres_url: str,
+) -> None:
+    async def exercise() -> None:
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        canary = "SENSITIVE_REPORT_CANARY_7f46"
+        now = utcnow()
+        try:
+            async with sessions() as session:
+
+                async def create_identity(slug: str):
+                    team = Team(slug=f"{slug}-{uuid.uuid4().hex}", name=canary)
+                    session.add(team)
+                    await session.flush()
+                    user = User(team_id=team.id, email=f"{slug}-{canary}@example.test", password_hash="hash")
+                    session.add(user)
+                    await session.flush()
+                    await session.commit()
+                    return await PostgresStore(session).find_user(team.id, user.email)
+
+                async def create_task_for(identity, label: str):
+                    store = PostgresStore(session)
+                    pairing = f"pair-{label}-{uuid.uuid4().hex}"
+                    await store.create_pairing_code(identity, pairing, utcnow() + timedelta(minutes=5))
+                    device, credential, projects = await store.consume_pairing_code(
+                        pairing, f"device-{label}", f"key-{label}", "runtime", [f"project-{label}"]
+                    )
+                    conversation = await store.create_conversation(identity, f"{canary}-{label}")
+                    task, _ = await store.create_task(
+                        identity, device.id, projects[0].id, conversation.id, f"key-{label}", f"{canary}-{label}"
+                    )
+                    return store, device, credential, task
+
+                team_a, team_b = await create_identity("report-a"), await create_identity("report-b")
+                store, device_completed, _, completed = await create_task_for(team_a, "completed")
+                await store.acknowledge_delivery(device_completed, completed.id, completed.delivery_id)
+                await store.append_event(device_completed, completed.id, "completed-event", "turn/completed", {})
+                rollback, _ = await store.request_rollback(completed.id, team_a)
+
+                store, device_failed, _, failed = await create_task_for(team_a, "failed-missing")
+                await store.acknowledge_delivery(device_failed, failed.id, failed.delivery_id)
+                await session.execute(
+                    update(Task).where(Task.id == failed.id).values(status=TaskStatus.failed, completed_at=now)
+                )
+                await session.commit()
+
+                store, device_cancelled, _, cancelled = await create_task_for(team_a, "cancelled")
+                await store.acknowledge_delivery(device_cancelled, cancelled.id, cancelled.delivery_id)
+                await store.append_event(device_cancelled, cancelled.id, "cancelled-event", "turn/cancelled", {})
+
+                store, device_active, credential_active, active = await create_task_for(team_a, "active")
+                await store.append_event(device_active, active.id, "gap-one", "text.delta", {"text": canary})
+                await store.append_event(
+                    device_active,
+                    active.id,
+                    "gap-two",
+                    "item/commandExecution/requestApproval",
+                    {"request_id": 42, "secret": canary},
+                )
+                approval = (await store.list_approvals(active.id, team_a))[0]
+                await store.decide_approval(approval.id, team_a, "approved")
+                authorization = await store.create_model_token(
+                    device_active,
+                    active.id,
+                    "report-token",
+                    f"report-jti-{uuid.uuid4().hex}",
+                    "deepseek-v4-flash",
+                    now + timedelta(minutes=5),
+                )
+                await store.record_model_usage(authorization, f"provider-{uuid.uuid4().hex}", 4, 6)
+                await session.execute(
+                    update(Task).where(Task.id == active.id).values(requested_at=now - timedelta(hours=3))
+                )
+                second_event = await session.scalar(
+                    select(TaskEvent).where(TaskEvent.task_id == active.id, TaskEvent.sequence == 2)
+                )
+                second_event.sequence = 3
+                session.add_all(
+                    [
+                        AuditEvent(team_id=team_a.team_id, task_id=active.id, event_type=name, metadata_={})
+                        for name in ("workspace.sync.failed", "rollback.failed", "backup.failed")
+                    ]
+                )
+                await session.commit()
+
+                store, device_b, _, completed_b = await create_task_for(team_b, "team-b-completed")
+                await store.acknowledge_delivery(device_b, completed_b.id, completed_b.delivery_id)
+                await store.append_event(device_b, completed_b.id, "team-b-terminal", "turn/completed", {})
+
+                store, device_old, _, old = await create_task_for(team_b, "old")
+                await store.acknowledge_delivery(device_old, old.id, old.delivery_id)
+                await session.execute(
+                    update(Task)
+                    .where(Task.id == old.id)
+                    .values(
+                        status=TaskStatus.failed,
+                        requested_at=now - timedelta(days=3),
+                        completed_at=now - timedelta(days=3),
+                    )
+                )
+                await session.commit()
+
+                settings = Settings(database_url=migrated_postgres_url, codex_rollout_mode="disabled")
+                global_report = await collect_report(session, settings, 24, 2, None)
+                team_report = await collect_report(session, settings, 24, 2, team_a.team_id)
+
+                assert global_report["tasks_by_status"] == {
+                    "completed": 2,
+                    "failed": 1,
+                    "cancelled": 1,
+                    "pending": 1,
+                    "running": 0,
+                    "waiting_approval": 0,
+                }
+                assert global_report["terminal_ratios"] == {"completed": 0.5, "failed": 0.25, "cancelled": 0.25}
+                assert global_report["pending_deliveries"] == {"task": 1, "approval": 1, "rollback": 1}
+                assert global_report["stale_active"]["pending"] == 1
+                assert global_report["failure_audits"] == {
+                    "workspace.sync.failed": 1,
+                    "rollback.failed": 1,
+                    "backup.failed": 1,
+                }
+                assert global_report["model_usage"] == {"requests": 1, "input_tokens": 4, "output_tokens": 6}
+                assert global_report["audit_checks"] == {
+                    "task_event_sequence_gaps": 1,
+                    "terminal_tasks_without_terminal_event": 1,
+                }
+                assert team_report["tasks_by_status"]["completed"] == 1
+                assert team_report["team_filter_applied"] is True
+                assert canary not in json.dumps(global_report, sort_keys=True)
+                assert canary not in json.dumps(team_report, sort_keys=True)
+                assert rollback.delivery_id is not None and credential_active
         finally:
             await engine.dispose()
 
