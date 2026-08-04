@@ -21,6 +21,14 @@ The next Responses request must contain a string `function_call_output` with the
 
 Cancellation remains a separate future ignored test: it has different timing and terminal-event assertions, and combining it with mutation/rollback would make failures ambiguous and the fixture nondeterministic.
 
+## Cancellation release gate
+
+The separate ignored test `real_codex_cancels_observed_local_responses_stream` now encodes the complete cancellation contract with a synchronized localhost long-running stream. It waits until the real pinned artifact has received `response.created` and `response.in_progress`, calls the existing `turn/interrupt` API, requires `turn/completed` with `turn.status` exactly `interrupted`, rejects approvals, checks both real and shadow workspaces remain unchanged, and requires the upstream TCP stream to close within ten seconds.
+
+The real `0.145.0-alpha.27` artifact was run twice against this fixture. Both runs emitted the correct `interrupted` terminal status and left the workspaces unchanged, but both failed because the upstream Responses connection remained open for the full ten-second observation window. The test intentionally remains a failing ignored release gate; accepting only the local terminal notification would hide an upstream resource leak and weaken the cancellation requirement. Runtime shutdown still terminates the process and test resources afterward.
+
+Do not mark cancellation accepted or enable this test in the regular suite until a pinned Codex runtime closes the active upstream response promptly after interruption. When the runtime is upgraded, rerun this exact test before changing its timeout or assertions.
+
 The localhost test remains deterministic, authenticated, catalog-pinned, external-network-free and bounded by timeouts. Run it with:
 
 ```powershell

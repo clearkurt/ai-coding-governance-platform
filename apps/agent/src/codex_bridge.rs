@@ -1013,6 +1013,163 @@ fn main() {
         stub.await.unwrap();
         let _ = fs::remove_dir_all(base);
     }
+
+    #[tokio::test]
+    #[ignore = "requires COMPANY_AGENT_REAL_CODEX and exercises real Codex cancellation"]
+    async fn real_codex_cancels_observed_local_responses_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Some(artifact) = std::env::var_os("COMPANY_AGENT_REAL_CODEX").map(PathBuf::from) else {
+            eprintln!("skipped: COMPANY_AGENT_REAL_CODEX is not set");
+            return;
+        };
+        let base =
+            std::env::temp_dir().join(format!("codex-cancel-smoke-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let auth_source = base.join("auth.rs");
+        let auth_exe = base.join(if cfg!(windows) { "auth.exe" } else { "auth" });
+        fs::write(
+            &auth_source,
+            "fn main(){print!(\"integration-short-token\");}",
+        )
+        .unwrap();
+        assert!(
+            StdCommand::new("rustc")
+                .arg(&auth_source)
+                .arg("-o")
+                .arg(&auth_exe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let stub = tokio::spawn(async move {
+            let mut entered_tx = Some(entered_tx);
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let headers_end;
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 1024 * 1024);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(position) =
+                        request.windows(4).position(|value| value == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..position]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= position + 4 + length {
+                            headers_end = position;
+                            break;
+                        }
+                    }
+                }
+                let headers = String::from_utf8_lossy(&request[..headers_end]).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer integration-short-token"));
+                if headers
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .starts_with("get /v1/models?")
+                {
+                    let models = json!({"models":[{"slug":"deepseek-v4-flash","display_name":"DeepSeek V4 Flash","description":"Company-managed DeepSeek Responses model","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium","description":"Default reasoning"}],"shell_type":"default","visibility":"list","supported_in_api":true,"priority":1,"supports_parallel_tool_calls":true,"context_window":128000,"effective_context_window_percent":95,"input_modalities":["text"],"use_responses_lite":false}]}).to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Model-Catalog-Version: deepseek-v4-flash-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        models.len(),
+                        models
+                    );
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    continue;
+                }
+                assert_eq!(
+                    headers.lines().next().unwrap_or(""),
+                    "post /v1/responses http/1.1"
+                );
+                let body: Value = serde_json::from_slice(&request[headers_end + 4..]).unwrap();
+                assert_eq!(body["model"], "deepseek-v4-flash");
+                let response = json!({"id":"resp_cancel","object":"response","created_at":1,"status":"in_progress","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"deepseek-v4-flash","output":[],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{"effort":null,"summary":null},"store":false,"temperature":null,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_p":null,"truncation":"disabled","usage":null,"user":null,"metadata":{}});
+                let sse = format!(
+                    "data: {}\n\ndata: {}\n\n",
+                    json!({"type":"response.created","sequence_number":0,"response":response}),
+                    json!({"type":"response.in_progress","sequence_number":1,"response":response})
+                );
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}").as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                entered_tx.take().unwrap().send(()).unwrap();
+                let closed =
+                    tokio::time::timeout(Duration::from_secs(10), socket.read(&mut buffer)).await;
+                closed_tx
+                    .send(matches!(closed, Ok(Ok(0)) | Ok(Err(_))))
+                    .unwrap();
+                return;
+            }
+            panic!("Codex did not establish a Responses stream")
+        });
+        let release = ReleaseManifest {
+            version: PINNED_PROTOCOL_VERSION.into(),
+            sha256: hex_sha256(&fs::read(&artifact).unwrap()),
+            schema_version: PINNED_APP_SERVER_SCHEMA_VERSION.into(),
+            model_catalog_version: PINNED_MODEL_CATALOG_VERSION.into(),
+            config_template_version: PINNED_CONFIG_TEMPLATE_VERSION.into(),
+        };
+        install_release(&base.join("runtime"), &artifact, &release).unwrap();
+        let real = base.join("workspace");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("keep.txt"), b"unchanged").unwrap();
+        let real = fs::canonicalize(real).unwrap();
+        let shadow =
+            crate::workspace::ShadowWorkspace::create(&base.join("shadows"), "cancel-task", &real)
+                .unwrap();
+        let mut server = CodexAppServer::start(RuntimeConfig {
+            managed_runtime_dir: base.join("runtime"),
+            release,
+            request_timeout: Duration::from_secs(15),
+            codex_home: base.join("home"),
+            responses_base_url: format!("http://{address}/v1"),
+            auth_command: auth_exe,
+        })
+        .await
+        .unwrap();
+        let result = async {
+            let thread = server.start_thread(&shadow.path).await?;
+            let turn = server.start_turn(&thread, &shadow.path, "Wait for the deterministic local response.").await?;
+            tokio::time::timeout(Duration::from_secs(15), entered_rx).await??;
+            server.interrupt(&thread, &turn).await?;
+            let terminal = tokio::time::timeout(Duration::from_secs(15), async { loop { tokio::select! { Some(notification)=server.notifications.recv()=> if notification.method=="turn/completed" { break notification.params }, Some(request)=server.server_requests.recv()=>panic!("unexpected approval during cancel: {}",request.method), else=>panic!("Codex streams closed before cancelled terminal") } } }).await?;
+            assert_eq!(terminal["turn"]["status"], "interrupted");
+            let upstream_closed = tokio::time::timeout(Duration::from_secs(12), closed_rx).await??;
+            assert!(upstream_closed, "pinned Codex left the upstream Responses stream open after interrupted terminal");
+            anyhow::Ok(())
+        }.await;
+        assert_eq!(fs::read(real.join("keep.txt")).unwrap(), b"unchanged");
+        assert_eq!(
+            fs::read(shadow.path.join("keep.txt")).unwrap(),
+            b"unchanged"
+        );
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(&shadow.path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != ".company-shadow-manifest.json")
+                .count(),
+            1
+        );
+        server.shutdown().await.unwrap();
+        stub.await.unwrap();
+        let _ = fs::remove_dir_all(&base);
+        result.unwrap();
+    }
     #[test]
     fn install_is_managed_and_runtime_detects_tampering() {
         let artifact = compile_mock_server();

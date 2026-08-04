@@ -26,6 +26,8 @@ The second ignored test uses a one-shot localhost Responses stub and temporary c
 
 That real test also verifies the minimum request-side `shell_command` function schema emitted by the pinned artifact without logging the request body or token. Its deterministic non-text phase drives one fixed temporary-workspace file write through the official Responses function-call stream, requires and explicitly accepts the real App Server approval, checks the matching tool-output continuation, syncs the shadow change through existing hash preconditions, then restores the pre-turn backup. It never calls an external model or approves network, hardware, or unrelated side effects. See [codex-tool-loop-contract-audit.md](../../docs/codex-tool-loop-contract-audit.md).
 
+The separate ignored cancellation integration is currently a failing release gate for `0.145.0-alpha.27`: two real runs produced the strict `interrupted` terminal state and no workspace changes, but the artifact did not close the active localhost Responses stream within ten seconds. The assertion is intentionally not weakened; see the audit document for the exact boundary.
+
 ## Pairing
 
 ```powershell
