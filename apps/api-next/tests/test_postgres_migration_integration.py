@@ -1044,13 +1044,13 @@ def test_postgres_rollout_report_aggregates_and_filters_without_sensitive_data(
                     "completed": 2,
                     "failed": 1,
                     "cancelled": 1,
-                    "pending": 1,
+                    "pending": 0,
                     "running": 0,
-                    "waiting_approval": 0,
+                    "waiting_approval": 1,
                 }
                 assert global_report["terminal_ratios"] == {"completed": 0.5, "failed": 0.25, "cancelled": 0.25}
                 assert global_report["pending_deliveries"] == {"task": 1, "approval": 1, "rollback": 1}
-                assert global_report["stale_active"]["pending"] == 1
+                assert global_report["stale_active"]["waiting_approval"] == 1
                 assert global_report["failure_audits"] == {
                     "workspace.sync.failed": 1,
                     "rollback.failed": 1,
@@ -1061,7 +1061,21 @@ def test_postgres_rollout_report_aggregates_and_filters_without_sensitive_data(
                     "task_event_sequence_gaps": 1,
                     "terminal_tasks_without_terminal_event": 1,
                 }
-                assert team_report["tasks_by_status"]["completed"] == 1
+                assert team_report["tasks_by_status"] == {
+                    "completed": 1,
+                    "failed": 1,
+                    "cancelled": 1,
+                    "pending": 0,
+                    "running": 0,
+                    "waiting_approval": 1,
+                }
+                assert team_report["terminal_ratios"] == {
+                    "completed": 0.333333,
+                    "failed": 0.333333,
+                    "cancelled": 0.333333,
+                }
+                assert team_report["pending_deliveries"] == {"task": 1, "approval": 1, "rollback": 1}
+                assert team_report["stale_active"]["waiting_approval"] == 1
                 assert team_report["team_filter_applied"] is True
                 assert canary not in json.dumps(global_report, sort_keys=True)
                 assert canary not in json.dumps(team_report, sort_keys=True)
