@@ -8,7 +8,7 @@
 
 | 范围 | 结果 |
 |---|---|
-| FastAPI | 普通 `pytest` 43 项通过、5 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle、同进程 localhost WebSocket reconnect、uvicorn 子进程重启与 custom-format backup/restore integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
+| FastAPI | 普通 `pytest` 46 项通过、6 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle、同进程 localhost WebSocket reconnect、uvicorn 子进程重启、custom-format backup/restore 与 localhost TLS/WSS integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
 | Rust daemon | `cargo test` 51 项通过，2 项真实 artifact smoke 默认 ignored；初始化与 localhost Responses turn smoke 均已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
@@ -27,6 +27,7 @@ Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable
 - 本机 PostgreSQL 16 已完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。真实 `PostgresStore` lifecycle 会在任务提交、未 ACK 审批决定和未 ACK 回滚之间关闭旧 session，并用全新 `AsyncSession/PostgresStore` 验证相同 delivery 的恢复及 ACK 后消失。另有独立 integration 验证完整 FastAPI ASGI 进程退出、连接注册表丢失及新进程对未确认 delivery 的恢复。custom-format backup/restore 演练也已在本机显式通过：恢复到全新数据库后验证 18 张业务表、21 个外键、26 个唯一约束、完整枚举，以及 pending task/approval、事件、模型用量和审计数据。生产同版本实例的备份、恢复和故障演练仍未完成。
 - 环境变量控制的 localhost socket integration 已用真实 uvicorn 和 `websockets` client 通过，验证了 dispatch ACK 前断线后的相同 delivery 重放、event ACK 前断线后的 source ID 去重与相同 sequence，以及 approval/rollback delivery 重放和 ACK。它只验证本机明文 `ws://127.0.0.1`，不证明 TLS、反向代理、证书链或生产 WSS。
 - uvicorn 子进程重启 integration 已在本机 PostgreSQL 16 显式运行通过：第一个真实 ASGI 进程在 dispatch ACK 前退出，第二个全新进程和连接注册表连接同一随机 PostgreSQL 数据库，并重放完全相同的 task/delivery 后成功 ACK。它只证明 localhost 进程边界恢复，不代表生产进程管理、TLS 或多实例协调。
+- localhost TLS/WSS integration 已显式运行通过：客户端信任一次性测试 CA 时可完成设备认证、delivery 重放及 ACK；未知 CA 和可信 CA 下的主机名不匹配均在保持证书校验启用时握手失败。它只证明直连 uvicorn 的本地 TLS 契约，不代表生产反向代理、证书签发/轮换、TLS 策略或真实网络路径。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
 - 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端 DeepSeek 模型任务、审批、取消、同步和回滚。真实 artifact 安装、初始化及 localhost Responses stub 文本 turn 已通过，但 stub 不证明 DeepSeek 行为、模型质量或完整企业任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。

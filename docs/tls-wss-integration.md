@@ -1,5 +1,7 @@
 # Local TLS/WSS integration contract
 
+Status: passed on this checkout against a real localhost uvicorn TLS process and a random PostgreSQL 16 database. This result does not replace production reverse-proxy or PKI validation.
+
 The environment-gated API integration `test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay` validates the application's local TLS WebSocket contract without using a production certificate or private key.
 
 The test creates a temporary one-use CA and RSA server certificate with the explicit `IP:127.0.0.1` subject alternative name. It starts a real uvicorn TLS child process on a random localhost port against a random migrated PostgreSQL database. A client that trusts only the temporary CA must authenticate a device, receive a persisted delivery, disconnect, receive the identical delivery again, and ACK it. A default client that does not trust the temporary CA must fail its TLS handshake. A client that trusts the CA but requests `localhost` instead of the certified `127.0.0.1` identity must also fail hostname verification.
