@@ -16,10 +16,13 @@ To smoke-test a company-approved real Codex artifact without making a model requ
 ```powershell
 $env:COMPANY_AGENT_REAL_CODEX = "D:\staging\codex.exe"
 cargo test real_pinned_codex_artifact_initializes_with_strict_config -- --ignored --nocapture
+cargo test real_codex_completes_turn_against_local_responses_stub -- --ignored --nocapture
 Remove-Item Env:COMPANY_AGENT_REAL_CODEX
 ```
 
 The test computes the artifact hash, installs it into a temporary daemon-managed release directory using the four compile-time pin constants, starts App Server with strict managed configuration, completes `initialize`/`initialized`, shuts it down, and removes the temporary directory. It does not start a thread/turn, invoke the Responses endpoint, or print a token. An unset variable produces an explicit skip message; no user-specific path or hash is embedded in the repository.
+
+The second ignored test uses a one-shot localhost Responses stub and temporary command-auth helper. A real pinned App Server fetches the authenticated fixed company model catalog, starts a thread/turn, consumes the documented text streaming event sequence, and must emit the fixed text plus `turn/completed` without approval or workspace changes. This proves local Codex/Responses protocol compatibility, not DeepSeek behavior or model quality.
 
 ## Pairing
 

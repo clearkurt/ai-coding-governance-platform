@@ -8,10 +8,11 @@
 
 | 范围 | 结果 |
 |---|---|
-| FastAPI | 普通 `pytest` 29 项通过、3 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle 与 localhost WebSocket reconnect integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
+| FastAPI | 普通 `pytest` 30 项通过、3 项真实 PostgreSQL integration 默认 skipped；migration、`PostgresStore` lifecycle 与 localhost WebSocket reconnect integration 均已在本机 PostgreSQL 16 显式运行通过；`ruff check .` 通过 |
 | Vue | Vitest 2 项通过；生产构建通过；Playwright 1 项通过 |
-| Rust daemon | `cargo test` 51 项通过，1 项真实 artifact smoke 默认 ignored；该 smoke 已在本机显式运行通过 |
+| Rust daemon | `cargo test` 51 项通过，2 项真实 artifact smoke 默认 ignored；初始化与 localhost Responses turn smoke 均已在本机显式运行通过 |
 | 真实 Codex artifact smoke | 固定版本 `0.145.0-alpha.27` 已通过托管安装、SHA-256 校验、strict config、App Server initialize/initialized 与正常关闭；未触发模型请求 |
+| 本地 Responses 协议闭环 | 同一真实 Codex 已通过带认证的固定单模型 catalog、临时 command auth 和 localhost stub 完成固定文本 thread/turn；无审批且 workspace 未变化 |
 | 旧链路 | 根目录 legacy build 与 smoke test 通过 |
 | 依赖审计 | `npm audit` 0 个漏洞 |
 
@@ -26,7 +27,7 @@ Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable
 - 本机 PostgreSQL 16 已完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。真实 `PostgresStore` lifecycle 会在任务提交、未 ACK 审批决定和未 ACK 回滚之间关闭旧 session，并用全新 `AsyncSession/PostgresStore` 验证相同 delivery 的恢复及 ACK 后消失。这证明 Store/数据库持久恢复，不等同于完整 FastAPI ASGI 进程重启、连接注册表重建或真实 WSS socket 重连。生产同版本实例的备份、恢复和故障演练仍未完成。
 - 环境变量控制的 localhost socket integration 已用真实 uvicorn 和 `websockets` client 通过，验证了 dispatch ACK 前断线后的相同 delivery 重放、event ACK 前断线后的 source ID 去重与相同 sequence，以及 approval/rollback delivery 重放和 ACK。它只验证本机明文 `ws://127.0.0.1`，不证明 TLS、反向代理、证书链或生产 WSS。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
-- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端模型任务、审批、取消、同步和回滚。真实 artifact 的安装与 App Server 初始化 smoke 已通过，但不能替代完整任务闭环。
+- 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端 DeepSeek 模型任务、审批、取消、同步和回滚。真实 artifact 安装、初始化及 localhost Responses stub 文本 turn 已通过，但 stub 不证明 DeepSeek 行为、模型质量或完整企业任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。
 - 完成小规模设备灰度、故障注入和长任务测试，包括进程崩溃、网络抖动、服务重启、磁盘不足、并发冲突和审计重放。
 - Durable outbox 仍是单机本地文件，不替代磁盘损坏、磁盘耗尽、设备丢失或跨设备复制测试；达到条数/单事件/总量上限时 daemon 会拒绝继续假装成功，需要运维介入并保留旧链路。

@@ -12,6 +12,7 @@ from app.settings import get_settings
 from app.store import Store
 
 ALLOWED_MODEL = "deepseek-v4-flash"
+MODEL_CATALOG_VERSION = "deepseek-v4-flash-1"
 HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -26,6 +27,42 @@ HOP_HEADERS = {
     "content-length",
 }
 _semaphore: asyncio.Semaphore | None = None
+
+
+def codex_model_catalog() -> dict:
+    return {
+        "models": [
+            {
+                "slug": ALLOWED_MODEL,
+                "display_name": "DeepSeek V4 Flash",
+                "description": "Company-managed DeepSeek Responses model",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "medium", "description": "Default reasoning"}],
+                "shell_type": "default",
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": 1,
+                "supports_parallel_tool_calls": True,
+                "context_window": 128000,
+                "effective_context_window_percent": 95,
+                "input_modalities": ["text"],
+                "use_responses_lite": False,
+            }
+        ]
+    }
+
+
+async def model_catalog(request: Request, store: Store = Depends(get_store)) -> Response:
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Bearer ") or not await store.validate_model_token(
+        authorization[7:], ALLOWED_MODEL
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "valid task-bound model token required")
+    return Response(
+        json.dumps(codex_model_catalog()),
+        media_type="application/json",
+        headers={"X-Model-Catalog-Version": MODEL_CATALOG_VERSION},
+    )
 
 
 async def get_model_http_client() -> AsyncIterator[httpx.AsyncClient]:

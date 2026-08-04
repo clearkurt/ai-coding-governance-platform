@@ -384,6 +384,16 @@ def test_model_token_is_task_and_device_bound(client, seeded_store):
     assert denied.status_code == 400
 
 
+def test_codex_model_catalog_is_task_token_authenticated_and_fixed(client, seeded_store):
+    _, token, _ = create_task_and_model_token(client, seeded_store, "catalog")
+    denied = client.get("/v1/models")
+    assert denied.status_code == 401
+    response = client.get("/v1/models?client_version=0.145.0", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.headers["x-model-catalog-version"] == "deepseek-v4-flash-1"
+    assert [model["slug"] for model in response.json()["models"]] == ["deepseek-v4-flash"]
+
+
 def test_approval_decision_is_idempotent_cross_team_safe_and_cancel_routes(client, seeded_store):
     store, _, user_b, device, _, _, _, _, _ = seeded_store
     task, _, headers = create_task_and_model_token(client, seeded_store, "approval")

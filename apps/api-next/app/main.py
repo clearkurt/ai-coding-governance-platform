@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import SessionLocal, engine, get_session
 from app.dependencies import SESSION_COOKIE, current_user, get_store, new_session_token, session_expiry
 from app.device_registry import DeviceConnectionRegistry
-from app.model_proxy import proxy_responses
+from app.model_proxy import model_catalog, proxy_responses
 from app.schemas import (
     ApprovalDecisionRequest,
     CreateConversationRequest,
@@ -53,6 +53,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Company Agent API", version="0.1.0", lifespan=lifespan)
 app.state.device_registry = DeviceConnectionRegistry()
 app.post("/v1/responses")(proxy_responses)
+app.get("/v1/models")(model_catalog)
 
 
 def task_out(task) -> TaskOut:
