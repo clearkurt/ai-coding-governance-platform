@@ -23,7 +23,7 @@ Daemon 的未确认 `task.event` 现会在本地受限、原子更新的 durable
 
 ## 尚未验证的生产门槛
 
-- 本机 PostgreSQL 16 已完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。随机专用数据库上的 migration 与真实 `PostgresStore` lifecycle integration 均已通过，覆盖会话、单次配对、任务幂等、审批、模型令牌、用量、审计、回滚与跨团队隔离。生产同版本实例的备份、恢复和故障演练仍未完成。
+- 本机 PostgreSQL 16 已完成真实 Alembic upgrade/downgrade/re-upgrade：upgrade 后共 19 张表（含 `alembic_version`）、21 个外键、26 个唯一约束，`task_status` 6 个值；downgrade 后仅余版本表且 enum 为 0；再次 upgrade 成功。真实 `PostgresStore` lifecycle 会在任务提交、未 ACK 审批决定和未 ACK 回滚之间关闭旧 session，并用全新 `AsyncSession/PostgresStore` 验证相同 delivery 的恢复及 ACK 后消失。这证明 Store/数据库持久恢复，不等同于完整 FastAPI ASGI 进程重启、连接注册表重建或真实 WSS socket 重连。生产同版本实例的备份、恢复和故障演练仍未完成。
 - 使用真实 DeepSeek key 验证 Responses API 流式转发、错误映射、限额和令牌过期/撤销。
 - 使用公司批准且固定 SHA-256 的真实 Codex artifact 完成 Windows 端到端模型任务、审批、取消、同步和回滚。真实 artifact 的安装与 App Server 初始化 smoke 已通过，但不能替代完整任务闭环。
 - 验证生产证书、域名、反向代理和 WSS TLS 链，包括断线重连与证书失败行为。

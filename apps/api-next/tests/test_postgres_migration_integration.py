@@ -137,7 +137,15 @@ def test_real_postgres_store_lifecycle(migrated_postgres_url: str) -> None:
                         identity_a, device.id, projects[0].id, conversation.id, "competing", "prompt"
                     )
                 assert await store.get_task_for_user(task.id, identity_b) is None
+
+            # Simulate process/Store reconstruction after the committed task dispatch.
+            async with sessions() as session:
+                store = PostgresStore(session)
+                pending = await store.pending_tasks_for_device(device)
+                assert [item.id for item in pending] == [task.id]
+                assert pending[0].delivery_id == task.delivery_id
                 assert await store.acknowledge_delivery(device, task.id, task.delivery_id)
+                assert (await store.pending_tasks_for_device(device))[0].status == "running"
 
                 first = await store.append_event(device, task.id, "event-1", "text.delta", {"text": "x"})
                 duplicate = await store.append_event(device, task.id, "event-1", "text.delta", {"text": "x"})
@@ -153,7 +161,20 @@ def test_real_postgres_store_lifecycle(migrated_postgres_url: str) -> None:
                 assert approval_event.payload["approval_id"] == str(approval.id)
                 decided, changed = await store.decide_approval(approval.id, identity_a, "approved")
                 assert changed and decided.decision_delivery_id
-                assert await store.acknowledge_approval_decision(device, approval.id, decided.decision_delivery_id)
+                approval_delivery_id = decided.decision_delivery_id
+
+            # An unacknowledged approval decision must survive Store reconstruction.
+            async with sessions() as session:
+                store = PostgresStore(session)
+                pending_approvals = await store.pending_approval_decisions(device)
+                assert len(pending_approvals) == 1
+                assert pending_approvals[0].id == approval.id
+                assert pending_approvals[0].decision_delivery_id == approval_delivery_id
+                assert await store.acknowledge_approval_decision(device, approval.id, approval_delivery_id)
+
+            async with sessions() as session:
+                store = PostgresStore(session)
+                assert await store.pending_approval_decisions(device) == []
 
                 token = "model-token"
                 authorization = await store.create_model_token(
@@ -173,7 +194,21 @@ def test_real_postgres_store_lifecycle(migrated_postgres_url: str) -> None:
                 assert await store.validate_model_token(token, "deepseek-v4-flash") is None
                 rollback, rollback_created = await store.request_rollback(task.id, identity_a)
                 assert rollback_created
-                assert await store.acknowledge_rollback(device, task.id, rollback.delivery_id, "succeeded")
+                rollback_delivery_id = rollback.delivery_id
+
+            # The terminal task's unacknowledged rollback must also survive reconstruction.
+            async with sessions() as session:
+                store = PostgresStore(session)
+                pending_rollbacks = await store.pending_rollbacks(device)
+                assert len(pending_rollbacks) == 1
+                assert pending_rollbacks[0].task_id == task.id
+                assert pending_rollbacks[0].delivery_id == rollback_delivery_id
+                assert await store.acknowledge_rollback(device, task.id, rollback_delivery_id, "succeeded")
+
+            async with sessions() as session:
+                store = PostgresStore(session)
+                assert await store.pending_rollbacks(device) == []
+                assert await store.pending_tasks_for_device(device) == []
                 audit_types = {event.event_type for event in await store.task_audit(task.id, identity_a)}
                 assert {
                     "task.created",
