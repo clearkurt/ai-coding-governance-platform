@@ -20,6 +20,7 @@ The project is moving from a custom server-side LLM tool loop plus Rust executor
 - Use DeepSeek's native Responses API as the Codex model provider. `deepseek-v4-flash` has been manually validated for the intended workflow.
 - Keep the real DeepSeek API key only on the central server. Codex should call a company Responses API proxy using a short-lived, device-bound token supplied by the local daemon.
 - Keep the Rust program as a small device bridge for pairing, Credential Manager storage, WSS reverse connection, heartbeats, reconnection, directory selection, Codex lifecycle/version management, event forwarding, backups, and audit upload.
+- Run Codex tasks only in daemon-managed sanitized shadow workspaces; synchronize successful deltas back with original-file hash preconditions and redact paths/secrets before WSS upload. See `docs/shadow-workspace-security.md`.
 - Retire the custom general-purpose Agent loop and local tools (`list_files`, `read_file`, `stage_patch`, `apply_patch`, and the `run_command` classifier) after the Codex path is proven and migrated.
 - Preserve the current Web UI, central authentication, device/project ownership, audit, quotas, and task persistence.
 - Do not expose Codex App Server directly over the network. The daemon starts it as a child process and uses stdio; the existing daemon-to-API channel remains validated WSS.

@@ -2,6 +2,7 @@ mod backup;
 mod codex_bridge;
 mod protocol;
 mod sandbox;
+mod workspace;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -403,8 +404,14 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
         }
         clear_active_task(&active_path, &stale.task_id)?;
     }
+    let stale_workspaces = data_dir.join("task-workspaces");
+    if stale_workspaces.exists() {
+        fs::remove_dir_all(&stale_workspaces).context("failed to clean stale task workspaces")?;
+    }
+    fs::create_dir_all(&stale_workspaces)?;
     let mut retry = Duration::from_secs(1);
     let mut outbox = BTreeMap::new();
+    let mut workspaces: BTreeMap<String, workspace::ShadowWorkspace> = BTreeMap::new();
     loop {
         match codex_bridge::CodexAppServer::start(runtime.clone()).await {
             Ok(mut bridge) => {
@@ -417,6 +424,7 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
                     &mut bridge,
                     &mut book,
                     &mut outbox,
+                    &mut workspaces,
                 )
                 .await
                 {
@@ -427,6 +435,7 @@ async fn run_codex(config: Config, credential: String, settings: CodexSettings) 
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 let _ = bridge.shutdown().await;
+                workspace::cleanup_all(&mut workspaces)?;
                 clear_instance_active_task(&active_path, &daemon_instance)?;
             }
             Err(error) => eprintln!("Codex App Server failed to start: {error:#}"),
@@ -459,6 +468,7 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let source_event_id = format!("agent:{}", uuid::Uuid::new_v4());
+    let payload = workspace::sanitize_audit(payload);
     let event = serde_json::json!({"type":"task.event","task_id":task_id,"source_event_id":source_event_id,"event_type":event_type,"payload":payload});
     outbox.insert(source_event_id, event.clone());
     send_json(write, event).await
@@ -471,9 +481,11 @@ async fn run_codex_connection(
     bridge: &mut codex_bridge::CodexAppServer,
     book: &mut codex_bridge::DispatchBook,
     outbox: &mut BTreeMap<String, serde_json::Value>,
+    workspaces: &mut BTreeMap<String, workspace::ShadowWorkspace>,
 ) -> Result<()> {
     let active_path = active_task_path()?;
     let backups = backup::BackupStore::new(agent_data_dir()?.join("task-backups"))?;
+    let shadow_base = agent_data_dir()?.join("task-workspaces");
     let url = codex_websocket_url(&config.server)?;
     let (socket, _) = connect_async(&url).await?;
     let (mut write, mut read) = socket.split();
@@ -509,19 +521,35 @@ async fn run_codex_connection(
                 let thread_id = notification.params.get("threadId").and_then(serde_json::Value::as_str).unwrap_or("");
                 let turn_id = notification.params.get("turnId").and_then(serde_json::Value::as_str).unwrap_or("");
                 let Some(task_id) = book.task_for_event(thread_id, turn_id).map(str::to_owned) else { continue };
+                let Some(shadow) = workspaces.get(&task_id) else { continue };
+                let mut event_type = notification.method.clone();
+                let mut payload = workspace::sanitize_event(notification.params, &shadow.path, shadow.real_root());
+                let mut sync_audit = None;
+                if notification.method == "turn/completed" {
+                    match shadow.sync_back(shadow.real_root()) {
+                        Ok(()) => sync_audit = Some(("workspace.sync.completed", serde_json::json!({"status":"completed"}))),
+                        Err(error) => {
+                            event_type = "turn/failed".into();
+                            payload = workspace::sanitize_event(serde_json::json!({"error":format!("safe workspace sync failed: {error:#}")}), &shadow.path, shadow.real_root());
+                            sync_audit = Some(("workspace.sync.failed", serde_json::json!({"error":error.to_string()})));
+                        }
+                    }
+                }
+                if let Some((audit_type,audit_payload))=sync_audit { send_audit_event(&mut write,outbox,&task_id,audit_type,audit_payload).await?; }
                 let source_event_id = notification.source_event_id.clone();
                 let event = serde_json::json!({
                     "type":"task.event",
                     "task_id":task_id,
                     "source_event_id":source_event_id,
-                    "event_type":notification.method,
-                    "payload":notification.params,
+                    "event_type":event_type,
+                    "payload":payload,
                 });
                 outbox.insert(source_event_id, event.clone());
                 send_json(&mut write, event).await?;
                 if is_terminal_turn_event(&notification.method) {
                     clear_active_task(&active_path, &task_id)?;
                     book.remove(&task_id);
+                    if let Some(shadow) = workspaces.remove(&task_id) { let _ = shadow.remove(); }
                     // Command-auth tokens are cached per provider. Restarting the pinned
                     // App Server at each task boundary guarantees no task reuses one.
                     bridge.shutdown().await?;
@@ -536,13 +564,17 @@ async fn run_codex_connection(
                     bridge.respond(request.id, Err(anyhow::anyhow!("approval request is not associated with an active task"))).await?;
                     continue;
                 };
+                let Some(shadow) = workspaces.get(task_id) else {
+                    bridge.respond(request.id, Err(anyhow::anyhow!("approval request workspace is unavailable"))).await?;
+                    continue;
+                };
                 let source_event_id = format!("codex-request:{}", request.id);
                 let event = serde_json::json!({
                     "type":"task.event",
                     "task_id":task_id,
                     "source_event_id":source_event_id,
                     "event_type":request.method,
-                    "payload":{"request_id":request.id,"params":request.params},
+                    "payload":{"request_id":request.id,"params":workspace::sanitize_event(request.params, &shadow.path, shadow.real_root())},
                 });
                 outbox.insert(source_event_id, event.clone());
                 send_json(&mut write, event).await?;
@@ -566,7 +598,6 @@ async fn run_codex_connection(
                             let prompt = value["prompt"].as_str().context("dispatch missing prompt")?;
                             let canonical = authorized_root(config, root_id)?;
                             claim_active_task(&active_path, task_id, daemon_instance)?;
-                            let thread_id = match bridge.start_thread(&canonical).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; return Err(error); } };
                             let manifest = match backups.create(task_id, root_id, &canonical) {
                                 Ok(manifest) => manifest,
                                 Err(error) => {
@@ -576,7 +607,10 @@ async fn run_codex_connection(
                                 }
                             };
                             send_audit_event(&mut write, outbox, task_id, "backup.created", serde_json::json!({"root_id":root_id,"files":manifest.entries.iter().filter(|entry| entry.kind == backup::EntryKind::File).count(),"snapshot_retention":"retained_until_explicit_cleanup"})).await?;
-                            let turn_id = match bridge.start_turn(&thread_id, &canonical, prompt).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; return Err(error); } };
+                            let shadow = match workspace::ShadowWorkspace::create(&shadow_base, task_id, &canonical) { Ok(value)=>value, Err(error)=>{clear_active_task(&active_path,task_id)?;send_audit_event(&mut write,outbox,task_id,"workspace.create.failed",serde_json::json!({"error":error.to_string()})).await?;return Err(error)} };
+                            let thread_id = match bridge.start_thread(&shadow.path).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; let _=shadow.remove(); return Err(error); } };
+                            let turn_id = match bridge.start_turn(&thread_id, &shadow.path, prompt).await { Ok(value) => value, Err(error) => { clear_active_task(&active_path, task_id)?; let _=shadow.remove(); return Err(error); } };
+                            workspaces.insert(task_id.to_owned(), shadow);
                             book.register(task_id.to_owned(), thread_id, turn_id);
                         }
                         send_json(&mut write, serde_json::json!({"type":"task.dispatch.ack","task_id":task_id,"delivery_id":delivery_id})).await?;
@@ -586,6 +620,7 @@ async fn run_codex_connection(
                         if let Some((thread_id, turn_id)) = book.interrupt_params(task_id) { bridge.interrupt(thread_id, turn_id).await?; }
                         clear_active_task(&active_path, task_id)?;
                         book.remove(task_id);
+                        if let Some(shadow)=workspaces.remove(task_id){let _=shadow.remove();}
                         bridge.shutdown().await?;
                         bail!("Codex task was cancelled; rotating task-bound model authentication")
                     }
