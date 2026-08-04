@@ -1,14 +1,19 @@
 import asyncio
 import json
 import os
+import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from asyncpg import PostgresError
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -31,10 +36,58 @@ EXPECTED_TASK_STATUSES = {
 }
 
 
+def _postgres_tool(name: str) -> list[str] | None:
+    prefix_raw = os.getenv("COMPANY_AGENT_TEST_POSTGRES_TOOL_PREFIX")
+    if prefix_raw:
+        try:
+            prefix = json.loads(prefix_raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("COMPANY_AGENT_TEST_POSTGRES_TOOL_PREFIX must be a JSON string array") from error
+        if not isinstance(prefix, list) or not prefix or not all(isinstance(item, str) and item for item in prefix):
+            raise ValueError("COMPANY_AGENT_TEST_POSTGRES_TOOL_PREFIX must be a non-empty JSON string array")
+        return [*prefix, name]
+    explicit = os.getenv(f"COMPANY_AGENT_TEST_{name.upper()}")
+    if explicit:
+        return [explicit] if Path(explicit).is_file() else None
+    discovered = shutil.which(name)
+    if discovered:
+        return [discovered]
+    program_files = Path(os.getenv("ProgramFiles", "C:/Program Files")) / "PostgreSQL"
+    candidates = sorted(program_files.glob(f"*/bin/{name}.exe"), reverse=True)
+    return [str(candidates[0])] if candidates else None
+
+
+def _tool_major(command: list[str]) -> int:
+    result = subprocess.run([*command, "--version"], capture_output=True, text=True, check=True, timeout=15)
+    match = re.search(r"PostgreSQL\)\s+(\d+)", result.stdout)
+    if not match:
+        raise ValueError(f"cannot parse PostgreSQL tool version from {command[-1]}")
+    return int(match.group(1))
+
+
+def _credential_free_url_and_password(url: str) -> tuple[str, str]:
+    parsed = make_url(url)
+    return parsed.set(password=None).render_as_string(hide_password=False), parsed.password or ""
+
+
 def test_postgres_identifier_quoting_escapes_role_names() -> None:
     assert _quote_identifier('admin"name') == '"admin""name"'
     with pytest.raises(ValueError):
         _quote_identifier("admin\x00name")
+
+
+def test_postgres_tool_prefix_is_parsed_as_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COMPANY_AGENT_TEST_POSTGRES_TOOL_PREFIX", '["wsl","-d","Ubuntu-24.04","--"]')
+
+    assert _postgres_tool("pg_dump") == ["wsl", "-d", "Ubuntu-24.04", "--", "pg_dump"]
+
+
+@pytest.mark.parametrize("prefix", ['"wsl"', "[]", '["wsl",""]', "not-json"])
+def test_postgres_tool_prefix_rejects_invalid_json_argv(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    monkeypatch.setenv("COMPANY_AGENT_TEST_POSTGRES_TOOL_PREFIX", prefix)
+
+    with pytest.raises(ValueError, match="JSON string array"):
+        _postgres_tool("pg_dump")
 
 
 @pytest.fixture
@@ -478,6 +531,194 @@ def test_uvicorn_process_restart_replays_unacknowledged_delivery(migrated_postgr
             await engine.dispose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_postgres_custom_backup_restore_preserves_pending_control_plane_state(
+    migrated_postgres_url: str,
+) -> None:
+    pg_dump, pg_restore = _postgres_tool("pg_dump"), _postgres_tool("pg_restore")
+    if not pg_dump or not pg_restore:
+        pytest.skip(
+            "pg_dump and pg_restore are required; add PostgreSQL bin to PATH or set "
+            "COMPANY_AGENT_TEST_PG_DUMP and COMPANY_AGENT_TEST_PG_RESTORE"
+        )
+    admin_url = os.environ[ADMIN_URL_ENV]
+
+    async def server_major() -> int:
+        import asyncpg
+
+        connection = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            return int(await connection.fetchval("SHOW server_version_num")) // 10000
+        finally:
+            await connection.close()
+
+    major = asyncio.run(server_major())
+    if _tool_major(pg_dump) != major or _tool_major(pg_restore) != major:
+        pytest.skip(f"pg_dump and pg_restore must match PostgreSQL server major version {major}")
+
+    async def seed_source():
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as session:
+                team = Team(slug=f"backup-{uuid.uuid4().hex}", name="Backup")
+                session.add(team)
+                await session.flush()
+                user = User(team_id=team.id, email="backup@example.test", password_hash="hash")
+                session.add(user)
+                await session.flush()
+                team_id, email = team.id, user.email
+                await session.commit()
+                store = PostgresStore(session)
+                identity = await store.find_user(team_id, email)
+                await store.create_pairing_code(identity, "backup-pair", utcnow() + timedelta(minutes=5))
+                device, credential, projects = await store.consume_pairing_code(
+                    "backup-pair", "backup-device", "backup-key", "runtime", ["Backup project"]
+                )
+                conversation = await store.create_conversation(identity, "Backup conversation")
+                task, _ = await store.create_task(
+                    identity, device.id, projects[0].id, conversation.id, "backup-task", "prompt"
+                )
+                await store.acknowledge_delivery(device, task.id, task.delivery_id)
+                await store.append_event(device, task.id, "backup-event", "text.delta", {"text": "persisted"})
+                await store.append_event(
+                    device,
+                    task.id,
+                    "backup-approval",
+                    "item/commandExecution/requestApproval",
+                    {"request_id": 91},
+                )
+                approval = (await store.list_approvals(task.id, identity))[0]
+                decided, _ = await store.decide_approval(approval.id, identity, "approved")
+                token = "backup-model-token"
+                authorization = await store.create_model_token(
+                    device,
+                    task.id,
+                    token,
+                    f"backup-jti-{uuid.uuid4().hex}",
+                    "deepseek-v4-flash",
+                    utcnow() + timedelta(minutes=5),
+                )
+                await store.record_model_usage(authorization, "backup-provider-request", 4, 6)
+                return identity, device, credential, task, approval.id, decided.decision_delivery_id, team_id
+        finally:
+            await engine.dispose()
+
+    identity, device, credential, task, approval_id, approval_delivery_id, team_id = asyncio.run(seed_source())
+    suffix = uuid.uuid4().hex
+    role, database, password = f"company_agent_restore_{suffix}", f"company_agent_restore_{suffix}", uuid.uuid4().hex
+    parsed_admin = make_url(admin_url)
+    qr, qd, qa = _quote_identifier(role), _quote_identifier(database), _quote_identifier(parsed_admin.username)
+    restored_url = parsed_admin.set(username=role, password=password, database=database).render_as_string(
+        hide_password=False
+    )
+    role_created = membership_granted = database_created = False
+    try:
+        asyncio.run(_admin_execute(admin_url, f"CREATE ROLE {qr} LOGIN PASSWORD {_quote_literal(password)}"))
+        role_created = True
+        asyncio.run(_admin_execute(admin_url, f"GRANT {qr} TO {qa}"))
+        membership_granted = True
+        asyncio.run(_admin_execute(admin_url, f"CREATE DATABASE {qd} OWNER {qr}"))
+        database_created = True
+        source_cli_url, source_password = _credential_free_url_and_password(migrated_postgres_url)
+        restored_cli_url, restored_password = _credential_free_url_and_password(restored_url)
+        with tempfile.TemporaryDirectory(prefix="company-agent-pg-backup-") as temporary:
+            dump_path = Path(temporary) / "control-plane.dump"
+            dump_env = {**os.environ, "PGPASSWORD": source_password}
+            with dump_path.open("wb") as dump_file:
+                subprocess.run(
+                    [*pg_dump, "--format=custom", "--no-owner", "--dbname", source_cli_url],
+                    env=dump_env,
+                    stdout=dump_file,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=120,
+                )
+            assert dump_path.stat().st_size > 0
+            restore_env = {**os.environ, "PGPASSWORD": restored_password}
+            with dump_path.open("rb") as dump_file:
+                subprocess.run(
+                    [*pg_restore, "--no-owner", "--exit-on-error", "--dbname", restored_cli_url],
+                    env=restore_env,
+                    stdin=dump_file,
+                    capture_output=True,
+                    check=True,
+                    timeout=120,
+                )
+
+        restored_schema = asyncio.run(_inspect_database(restored_url))
+        assert len(restored_schema["tables"] - {"alembic_version"}) == 18
+        assert {"tasks", "task_events", "approval_requests", "audit_events", "model_usage"} <= restored_schema["tables"]
+        assert restored_schema["foreign_key_count"] == 21
+        assert restored_schema["unique_constraint_count"] == 26
+        assert restored_schema["task_status_values"] == EXPECTED_TASK_STATUSES
+
+        async def verify_restore() -> None:
+            engine = create_async_engine(restored_url)
+            sessions = async_sessionmaker(engine, expire_on_commit=False)
+            try:
+                async with sessions() as session:
+                    store = PostgresStore(session)
+                    assert await store.authenticate_device(device.id, credential) == device
+                    pending_tasks = await store.pending_tasks_for_device(device)
+                    assert [item.id for item in pending_tasks] == [task.id]
+                    assert await store.acknowledge_delivery(device, task.id, task.delivery_id)
+                    pending_approvals = await store.pending_approval_decisions(device)
+                    assert len(pending_approvals) == 1
+                    assert pending_approvals[0].id == approval_id
+                    assert pending_approvals[0].decision_delivery_id == approval_delivery_id
+                    events = await store.events_after(task, 0)
+                    assert [(item.sequence, item.source_event_id) for item in events] == [
+                        (1, "backup-event"),
+                        (2, "backup-approval"),
+                    ]
+                    assert await store.model_usage_total(team_id) == 10
+                    audit = {item.event_type for item in await store.task_audit(task.id, identity)}
+                    assert {
+                        "task.created",
+                        "task.delivery_acknowledged",
+                        "approval.approved",
+                        "model.token_issued",
+                    } <= audit
+                    assert await store.acknowledge_approval_decision(device, approval_id, approval_delivery_id)
+                async with sessions() as session:
+                    assert await PostgresStore(session).pending_approval_decisions(device) == []
+            finally:
+                await engine.dispose()
+
+        asyncio.run(verify_restore())
+    finally:
+        cleanup_failures: list[Exception] = []
+        if database_created:
+            try:
+                asyncio.run(
+                    _admin_execute(
+                        admin_url,
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                        database,
+                    )
+                )
+            except PostgresError as error:
+                cleanup_failures.append(error)
+            try:
+                asyncio.run(_admin_execute(admin_url, f"DROP DATABASE {qd}"))
+            except PostgresError as error:
+                cleanup_failures.append(error)
+        if membership_granted:
+            try:
+                asyncio.run(_admin_execute(admin_url, f"REVOKE {qr} FROM {qa}"))
+            except PostgresError as error:
+                cleanup_failures.append(error)
+        if role_created:
+            try:
+                asyncio.run(_admin_execute(admin_url, f"DROP ROLE {qr}"))
+            except PostgresError as error:
+                cleanup_failures.append(error)
+        if cleanup_failures and sys.exc_info()[0] is None:
+            raise cleanup_failures[0]
 
 
 def _asyncpg_url(url: str) -> str:
