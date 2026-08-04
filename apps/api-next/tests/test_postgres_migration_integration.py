@@ -107,6 +107,15 @@ def _credential_free_url_and_password(url: str) -> tuple[str, str]:
     return cli_url, parsed.password or ""
 
 
+def _assert_control_plane_schema(snapshot: tuple[set[str], int, int, set[str]]) -> None:
+    tables, foreign_key_count, unique_constraint_count, task_status_values = snapshot
+    assert len(tables - {"alembic_version"}) == 18
+    assert {"tasks", "task_events", "approval_requests", "audit_events", "model_usage"} <= tables
+    assert foreign_key_count == 21
+    assert unique_constraint_count == 26
+    assert task_status_values == EXPECTED_TASK_STATUSES
+
+
 def test_postgres_identifier_quoting_escapes_role_names() -> None:
     assert _quote_identifier('admin"name') == '"admin""name"'
     with pytest.raises(ValueError):
@@ -185,6 +194,13 @@ def test_postgres_tool_error_redacts_password(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(AssertionError, match=r"pg_dump failed with exit code 2: password \[redacted\] was rejected"):
         _run_postgres_tool(["wsl", "--", "pg_dump"], "secret", capture_output=True)
+
+
+def test_control_plane_schema_contract_is_a_typed_tuple() -> None:
+    required_tables = {"tasks", "task_events", "approval_requests", "audit_events", "model_usage"}
+    tables = {"alembic_version", *required_tables, *(f"table_{index}" for index in range(13))}
+
+    _assert_control_plane_schema((tables, 21, 26, EXPECTED_TASK_STATUSES))
 
 
 @pytest.fixture
@@ -740,11 +756,7 @@ def test_postgres_custom_backup_restore_preserves_pending_control_plane_state(
                 )
 
         restored_schema = asyncio.run(_inspect_database(restored_url))
-        assert len(restored_schema["tables"] - {"alembic_version"}) == 18
-        assert {"tasks", "task_events", "approval_requests", "audit_events", "model_usage"} <= restored_schema["tables"]
-        assert restored_schema["foreign_key_count"] == 21
-        assert restored_schema["unique_constraint_count"] == 26
-        assert restored_schema["task_status_values"] == EXPECTED_TASK_STATUSES
+        _assert_control_plane_schema(restored_schema)
 
         async def verify_restore() -> None:
             engine = create_async_engine(restored_url)
