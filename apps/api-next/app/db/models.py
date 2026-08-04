@@ -78,6 +78,18 @@ class Session(IdTimestampMixin, TeamScopedMixin, Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PairingCode(IdTimestampMixin, TeamScopedMixin, Base):
+    __tablename__ = "pairing_codes"
+    __table_args__ = (
+        ForeignKeyConstraint(["creator_id", "team_id"], ["users.id", "users.team_id"], ondelete="CASCADE"),
+        UniqueConstraint("code_hash", name="uq_pairing_codes_code_hash"),
+    )
+    creator_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Device(IdTimestampMixin, TeamScopedMixin, Base):
     __tablename__ = "devices"
     __table_args__ = (

@@ -81,3 +81,19 @@ class ModelTokenResponse(BaseModel):
 
 class ApprovalDecisionRequest(BaseModel):
     decision: str
+
+
+class PairRoot(BaseModel):
+    label: str = Field(min_length=1, max_length=200)
+
+
+class LegacyPairPayload(BaseModel):
+    code: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=200)
+    publicKey: str = Field(min_length=1, max_length=4096)
+    version: str = Field(min_length=1, max_length=80)
+    roots: list[PairRoot] = Field(min_length=1, max_length=32)
+
+
+class CreateConversationRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)

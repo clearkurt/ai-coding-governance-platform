@@ -81,6 +81,83 @@ def test_login_and_expired_session_are_checked(client, seeded_store):
     assert client.get("/auth/me", headers=active).status_code == 401
 
 
+def test_pairing_code_is_single_use_and_creates_granted_resources(client, seeded_store):
+    store, user, *_ = seeded_store
+    headers = session_headers(store, user)
+    issued = client.post("/pairing-codes", headers=headers)
+    assert issued.status_code == 200
+    code = issued.json()["code"]
+    assert code not in store.pairing_codes
+    pair = {
+        "version": 1,
+        "messageId": "pair-message",
+        "type": "pair",
+        "payload": {
+            "code": code,
+            "name": "Workshop PC",
+            "publicKey": "public-key",
+            "version": "0.1.0",
+            "roots": [{"label": "Firmware"}],
+        },
+    }
+    with client.websocket_connect("/ws/devices") as socket:
+        socket.send_json(pair)
+        result = socket.receive_json()
+    assert result["type"] == "pair_result"
+    assert result["payload"]["credential"] not in store.credentials
+    assert len(result["payload"]["roots"]) == 1
+    projects = client.get("/projects", headers=headers).json()
+    assert any(project["display_name"] == "Firmware" for project in projects)
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws/devices") as socket:
+        socket.send_json(pair)
+        assert socket.receive_json()["type"] == "pair_error"
+        socket.receive_json()
+    assert all(
+        code not in str(event) and result["payload"]["credential"] not in str(event) for event in store.control_audit
+    )
+
+
+def test_expired_pairing_code_and_concurrent_consumption_are_rejected(seeded_store):
+    store, user, *_ = seeded_store
+    expired = "expired-code"
+    store.pairing_codes[hash_secret(expired)] = (user, utcnow() - timedelta(seconds=1), None)
+
+    async def exercise():
+        with pytest.raises(PermissionError):
+            await store.consume_pairing_code(expired, "PC", "key", "1", ["Root"])
+        raw = "one-winner"
+        await store.create_pairing_code(user, raw, utcnow() + timedelta(minutes=10))
+        results = await asyncio.gather(
+            store.consume_pairing_code(raw, "A", "key-a", "1", ["Root"]),
+            store.consume_pairing_code(raw, "B", "key-b", "1", ["Root"]),
+            return_exceptions=True,
+        )
+        assert sum(not isinstance(result, Exception) for result in results) == 1
+        assert sum(isinstance(result, PermissionError) for result in results) == 1
+
+    asyncio.run(exercise())
+
+
+def test_resource_discovery_and_conversations_are_user_and_team_scoped(client, seeded_store):
+    store, user_a, user_b, device_a, _, project_a, _, *_ = seeded_store
+    headers_a, headers_b = session_headers(store, user_a), session_headers(store, user_b)
+    store.project_names[project_a] = "Allowed project"
+    store.device_metadata[device_a.id] = ("Device A", "codex-1", utcnow())
+    created = client.post("/conversations", headers=headers_a, json={"title": "Private conversation"})
+    assert created.status_code == 201
+    assert client.get("/conversations", headers=headers_a).json()[0]["title"] == "Private conversation"
+    assert client.get("/conversations", headers=headers_b).json() == []
+    devices = client.get("/devices", headers=headers_a).json()
+    assert devices[0]["name"] == "Device A" and devices[0]["online"] is False
+    assert devices[0]["projects"][0]["display_name"] == "Allowed project"
+    assert all(
+        project["device_id"] == str(device_a.id) for project in client.get("/projects", headers=headers_a).json()
+    )
+    assert client.get("/devices", headers=headers_b).json() == []
+    store.devices[device_a.id] = DeviceIdentity(device_a.id, device_a.team_id, utcnow())
+    assert client.get("/devices", headers=headers_a).json() == []
+
+
 def test_cross_team_task_is_rejected_and_requests_are_idempotent(client, seeded_store):
     store, user, _, device_a, device_b, project_a, project_b, conversation_a, conversation_b = seeded_store
     headers = session_headers(store, user)
@@ -106,6 +183,8 @@ def test_cross_team_task_is_rejected_and_requests_are_idempotent(client, seeded_
     first, second = client.post("/tasks", headers=headers, json=body), client.post("/tasks", headers=headers, json=body)
     assert first.status_code == 201 and second.status_code == 200
     assert first.json()["id"] == second.json()["id"]
+    competing = client.post("/tasks", headers=headers, json={**body, "idempotency_key": "competing"})
+    assert competing.status_code == 409
 
 
 def test_device_websocket_auth_event_deduplication_and_sse_replay(client, seeded_store):

@@ -24,6 +24,8 @@ The first Alembic revision creates the target control-plane schema. It intention
 
 `POST /auth/login` creates a secure HttpOnly session cookie after checking a scrypt password hash. `POST /auth/logout` revokes that token server-side as well as clearing the cookie. Devices authenticate as the first message on `WSS /ws/devices`; their credentials are stored and checked only as hashes, with expiry and revocation checks.
 
+Logged-in users create a ten-minute single-use code with `POST /pairing-codes`. Rust `enroll` sends that code as the first `/ws/devices` message; successful consumption atomically creates the device, hashed credential, projects and creator grants. `GET /devices`, `GET /projects`, and `GET/POST /conversations` provide the target Vue resource workflow.
+
 `POST /tasks` is idempotent per team, device and idempotency key. A connected target device receives a `task.dispatch` with a durable `delivery_id`; reconnecting devices are redelivered pending/running tasks and acknowledge delivery with `task.dispatch.ack`. Device events are assigned an authoritative persisted sequence and deduplicated by `source_event_id`. Browsers resume `GET /tasks/{id}/events` with `Last-Event-ID`; the default stream follows later persisted events. `?follow=false` is available for bounded replay clients and tests.
 
 `POST /model-tokens` exchanges a valid device credential for a short-lived task-bound token. `POST /v1/responses` validates that token, enforces the selected model, concurrency and daily team quota, then transparently forwards raw streaming or non-streaming Responses API traffic to DeepSeek. The upstream key is never returned to the device.

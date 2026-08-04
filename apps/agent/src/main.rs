@@ -39,6 +39,8 @@ enum Command {
         code: String,
         #[arg(long, default_value = "Windows Agent")]
         name: String,
+        #[arg(long, help = "Use the legacy /api/agent/ws pairing endpoint")]
+        legacy: bool,
     },
     Run,
     Status,
@@ -229,13 +231,20 @@ fn websocket_url(server: &str) -> Result<String> {
         bail!("仅允许 localhost 的 ws:// 或生产 wss:// 服务器")
     }
 }
+fn enrollment_websocket_url(server: &str, legacy: bool) -> Result<String> {
+    if legacy {
+        websocket_url(server)
+    } else {
+        codex_websocket_url(server)
+    }
+}
 fn public_key() -> (SigningKey, String) {
     let key = SigningKey::generate(&mut OsRng);
     let public = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(VerifyingKey::from(&key).as_bytes());
     (key, public)
 }
-async fn enroll(server: String, code: String, name: String) -> Result<()> {
+async fn enroll(server: String, code: String, name: String, legacy: bool) -> Result<()> {
     let picked = pick_folder_foreground("选择允许 AI Agent 访问的工程根目录").await?;
     let canonical = fs::canonicalize(&picked)?;
     let (_, public_key) = public_key();
@@ -248,7 +257,8 @@ async fn enroll(server: String, code: String, name: String) -> Result<()> {
             .to_string(),
         path: canonical,
     };
-    let (mut socket, _) = connect_async(websocket_url(&server)?).await?;
+    let enrollment_url = enrollment_websocket_url(&server, legacy)?;
+    let (mut socket, _) = connect_async(enrollment_url).await?;
     let payload = PairPayload {
         code,
         name,
@@ -880,7 +890,12 @@ async fn main() -> Result<()> {
     guard_console_close();
     let cli = Cli::parse();
     match cli.command {
-        Command::Enroll { server, code, name } => enroll(server, code, name).await,
+        Command::Enroll {
+            server,
+            code,
+            name,
+            legacy,
+        } => enroll(server, code, name, legacy).await,
         Command::Run => run().await,
         Command::Status => status(),
         Command::ConfigureCodex { executable, sha256 } => configure_codex(executable, sha256),
@@ -985,6 +1000,18 @@ mod tests {
             "http://localhost:8000"
         );
         assert!(http_server_url("http://agent.example").is_err());
+    }
+
+    #[test]
+    fn enroll_defaults_to_target_gateway_and_legacy_is_explicit() {
+        assert_eq!(
+            enrollment_websocket_url("wss://agent.example", false).unwrap(),
+            "wss://agent.example/ws/devices"
+        );
+        assert_eq!(
+            enrollment_websocket_url("wss://agent.example", true).unwrap(),
+            "wss://agent.example/api/agent/ws"
+        );
     }
 
     #[test]

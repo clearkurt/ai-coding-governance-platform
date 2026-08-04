@@ -4,6 +4,7 @@ EXPECTED_TABLES = {
     "teams",
     "users",
     "sessions",
+    "pairing_codes",
     "devices",
     "device_credentials",
     "projects",
@@ -45,6 +46,7 @@ def test_sensitive_columns_store_only_hashes() -> None:
         ("sessions", "token_hash"),
         ("device_credentials", "credential_hash"),
         ("model_tokens", "token_hash"),
+        ("pairing_codes", "code_hash"),
     ):
         assert column_name in Base.metadata.tables[table_name].columns
         assert "token" not in {

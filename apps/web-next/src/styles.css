@@ -10,6 +10,8 @@ body { margin: 0; }
 .status-row code { color: #667085; font-size: 12px; overflow-wrap: anywhere; }
 .form-alert { margin-bottom: 14px; }
 .cancel-button { margin-left: 10px; }
+.inline-create { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: -8px 0 18px; }
+.pairing-code { margin-top: 14px; overflow-wrap: anywhere; }
 .approval-actions { display: flex; gap: 8px; margin-top: 8px; }
 .approval-panel { border: 1px solid #f0c36a; background: #fff9e8; border-radius: 8px; padding: 12px; margin-bottom: 16px; }
 .approval-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }

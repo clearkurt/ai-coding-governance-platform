@@ -48,6 +48,7 @@ npm install
 npm run dev
 npm test -- --run
 npm run build
+npm run test:e2e
 ```
 
 Windows 守护进程：

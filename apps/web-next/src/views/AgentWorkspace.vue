@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useSessionStore } from "../stores/session";
 import { useTaskStore } from "../stores/task";
+import { useResourceStore } from "../stores/resources";
 
 const session = useSessionStore();
 const task = useTaskStore();
+const resources = useResourceStore();
 const router = useRouter();
 const deviceId = ref("");
 const projectId = ref("");
@@ -13,6 +15,30 @@ const conversationId = ref("");
 const prompt = ref("");
 const submitting = ref(false);
 const formError = ref("");
+const pairingCode = ref("");
+const pairingExpiresAt = ref("");
+const conversationTitle = ref("");
+const deviceOptions = computed(() =>
+  resources.devices.map((device) => ({
+    label: `${device.name}${device.online ? "（在线）" : "（离线）"}`,
+    value: device.id,
+  })),
+);
+const selectedDevice = computed(() =>
+  resources.devices.find((device) => device.id === deviceId.value),
+);
+const projectOptions = computed(() =>
+  (selectedDevice.value?.projects ?? []).map((project) => ({
+    label: project.display_name,
+    value: project.id,
+  })),
+);
+const conversationOptions = computed(() =>
+  resources.conversations.map((conversation) => ({
+    label: conversation.title,
+    value: conversation.id,
+  })),
+);
 const canSubmit = computed(
   () =>
     deviceId.value.trim() &&
@@ -51,6 +77,43 @@ async function logout() {
   await router.push("/login");
 }
 
+async function createConversation() {
+  const title = conversationTitle.value.trim() || "新会话";
+  try {
+    const conversation = await resources.createConversation(title);
+    conversationId.value = conversation.id;
+    conversationTitle.value = "";
+  } catch (reason) {
+    formError.value = reason instanceof Error ? reason.message : "会话创建失败";
+  }
+}
+
+async function createPairingCode() {
+  try {
+    const result = await resources.createPairingCode();
+    pairingCode.value = result.code;
+    pairingExpiresAt.value = result.expires_at;
+  } catch (reason) {
+    formError.value = reason instanceof Error ? reason.message : "配对码创建失败";
+  }
+}
+
+watch(deviceId, () => {
+  if (!selectedDevice.value?.projects.some((project) => project.id === projectId.value)) {
+    projectId.value = selectedDevice.value?.projects[0]?.id ?? "";
+  }
+});
+onMounted(async () => {
+  try {
+    await resources.load();
+    deviceId.value = resources.devices[0]?.id ?? "";
+    projectId.value = resources.devices[0]?.projects[0]?.id ?? "";
+    conversationId.value = resources.conversations[0]?.id ?? "";
+  } catch (reason) {
+    formError.value = reason instanceof Error ? reason.message : "资源加载失败";
+  }
+});
+
 onBeforeUnmount(() => task.disconnect());
 </script>
 
@@ -68,14 +131,27 @@ onBeforeUnmount(() => task.disconnect());
         <NCard title="新任务" size="small">
           <NForm @submit.prevent="start">
             <NFormItem label="设备 ID">
-              <NInput v-model:value="deviceId" placeholder="已配对设备 UUID" />
+              <NSelect
+                v-model:value="deviceId"
+                :options="deviceOptions"
+                :loading="resources.loading"
+                placeholder="选择已配对设备"
+              />
             </NFormItem>
-            <NFormItem label="项目 ID">
-              <NInput v-model:value="projectId" placeholder="已授权项目 UUID" />
+            <NFormItem label="项目">
+              <NSelect v-model:value="projectId" :options="projectOptions" placeholder="选择授权项目" />
             </NFormItem>
-            <NFormItem label="会话 ID">
-              <NInput v-model:value="conversationId" placeholder="会话 UUID" />
+            <NFormItem label="会话">
+              <NSelect
+                v-model:value="conversationId"
+                :options="conversationOptions"
+                placeholder="选择会话"
+              />
             </NFormItem>
+            <div class="inline-create">
+              <NInput v-model:value="conversationTitle" placeholder="新会话标题" />
+              <NButton @click="createConversation">新建会话</NButton>
+            </div>
             <NFormItem label="需求">
               <NInput
                 v-model:value="prompt"
@@ -106,7 +182,11 @@ onBeforeUnmount(() => task.disconnect());
             >
               回滚本次修改
             </NButton>
+            <NButton class="cancel-button" @click="createPairingCode">生成设备配对码</NButton>
           </NForm>
+          <NAlert v-if="pairingCode" type="success" class="pairing-code">
+            配对码：<strong>{{ pairingCode }}</strong><br />有效期至 {{ pairingExpiresAt }}
+          </NAlert>
         </NCard>
         <NCard title="执行状态" size="small">
           <div class="status-row">

@@ -27,10 +27,12 @@ from app.device_registry import DeviceConnectionRegistry
 from app.model_proxy import proxy_responses
 from app.schemas import (
     ApprovalDecisionRequest,
+    CreateConversationRequest,
     CreateTaskRequest,
     CurrentUser,
     DeviceAuthentication,
     DeviceEventMessage,
+    LegacyPairPayload,
     LoginRequest,
     ModelTokenRequest,
     ModelTokenResponse,
@@ -147,6 +149,61 @@ async def logout(
 @app.get("/auth/me", response_model=CurrentUser)
 async def me(user: UserIdentity = Depends(current_user)) -> CurrentUser:
     return CurrentUser(id=user.id, team_id=user.team_id, email=user.email)
+
+
+@app.post("/pairing-codes")
+async def create_pairing_code(user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)):
+    raw = secrets.token_urlsafe(18)
+    expires_at = utcnow() + timedelta(minutes=10)
+    await store.create_pairing_code(user, raw, expires_at)
+    return {"code": raw, "expires_at": expires_at}
+
+
+def project_payload(project) -> dict[str, object]:
+    return {
+        "id": project.id,
+        "device_id": project.device_id,
+        "root_id": project.root_id,
+        "display_name": project.display_name,
+    }
+
+
+@app.get("/projects")
+async def projects(user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)):
+    return [project_payload(project) for project in await store.list_projects(user)]
+
+
+@app.get("/devices")
+async def devices(user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)):
+    result = []
+    for device in await store.list_devices(user):
+        result.append(
+            {
+                "id": device.id,
+                "name": device.name,
+                "runtime_version": device.runtime_version,
+                "last_seen_at": device.last_seen_at,
+                "online": await app.state.device_registry.is_online(device.id),
+                "projects": [project_payload(project) for project in device.projects],
+            }
+        )
+    return result
+
+
+@app.get("/conversations")
+async def conversations(user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)):
+    return [
+        {"id": item.id, "title": item.title, "created_at": item.created_at}
+        for item in await store.list_conversations(user)
+    ]
+
+
+@app.post("/conversations", status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    body: CreateConversationRequest, user: UserIdentity = Depends(current_user), store: Store = Depends(get_store)
+):
+    item = await store.create_conversation(user, body.title)
+    return {"id": item.id, "title": item.title, "created_at": item.created_at}
 
 
 async def device_from_headers(
@@ -275,6 +332,8 @@ async def create_task(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="project, device, or conversation is not available"
         ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     if created:
         await app.state.device_registry.deliver(task)
@@ -321,6 +380,33 @@ async def device_gateway(websocket: WebSocket, store: Store = Depends(websocket_
     device: DeviceIdentity | None = None
     try:
         raw_auth = await websocket.receive_json()
+        if raw_auth.get("type") == "pair":
+            try:
+                payload = LegacyPairPayload.model_validate(raw_auth.get("payload"))
+                paired, credential, projects = await store.consume_pairing_code(
+                    payload.code,
+                    payload.name,
+                    payload.publicKey,
+                    payload.version,
+                    [root.label for root in payload.roots],
+                )
+            except (ValidationError, PermissionError):
+                await websocket.send_json({"type": "pair_error", "payload": {"error": "配对码无效或已过期"}})
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            await websocket.send_json(
+                {
+                    "version": 1,
+                    "messageId": str(uuid.uuid4()),
+                    "type": "pair_result",
+                    "payload": {
+                        "deviceId": str(paired.id),
+                        "credential": credential,
+                        "roots": [{"id": project.root_id, "label": project.display_name} for project in projects],
+                    },
+                }
+            )
+            return
         auth = DeviceAuthentication.model_validate(raw_auth)
         if auth.type != "authenticate":
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)

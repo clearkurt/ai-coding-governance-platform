@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import secrets
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +19,7 @@ from app.db.models import (
     DeviceCredential,
     ModelToken,
     ModelUsage,
+    PairingCode,
     Project,
     ProjectGrant,
     Session,
@@ -112,6 +115,30 @@ class AuditIdentity:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class ProjectIdentity:
+    id: uuid.UUID
+    device_id: uuid.UUID
+    root_id: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class DeviceResource:
+    id: uuid.UUID
+    name: str
+    runtime_version: str | None
+    last_seen_at: datetime | None
+    projects: list[ProjectIdentity]
+
+
+@dataclass(frozen=True)
+class ConversationIdentity:
+    id: uuid.UUID
+    title: str
+    created_at: datetime
+
+
 class Store(Protocol):
     async def find_user(self, team_id: uuid.UUID, email: str) -> UserIdentity | None: ...
     async def create_session(self, user: UserIdentity, token: str, expires_at: datetime) -> None: ...
@@ -163,6 +190,14 @@ class Store(Protocol):
         self, device: DeviceIdentity, task_id: uuid.UUID, delivery_id: str, rollback_status: str
     ) -> bool: ...
     async def task_audit(self, task_id: uuid.UUID, user: UserIdentity) -> list[AuditIdentity]: ...
+    async def create_pairing_code(self, user: UserIdentity, raw_code: str, expires_at: datetime) -> None: ...
+    async def consume_pairing_code(
+        self, raw_code: str, name: str, public_key: str, version: str, root_labels: list[str]
+    ) -> tuple[DeviceIdentity, str, list[ProjectIdentity]]: ...
+    async def list_devices(self, user: UserIdentity) -> list[DeviceResource]: ...
+    async def list_projects(self, user: UserIdentity) -> list[ProjectIdentity]: ...
+    async def list_conversations(self, user: UserIdentity) -> list[ConversationIdentity]: ...
+    async def create_conversation(self, user: UserIdentity, title: str) -> ConversationIdentity: ...
 
 
 class PostgresStore:
@@ -196,6 +231,109 @@ class PostgresStore:
     async def find_user(self, team_id: uuid.UUID, email: str) -> UserIdentity | None:
         model = await self.session.scalar(select(User).where(User.team_id == team_id, User.email == email))
         return self._user(model) if model else None
+
+    async def create_pairing_code(self, user: UserIdentity, raw_code: str, expires_at: datetime) -> None:
+        self.session.add(
+            PairingCode(
+                team_id=user.team_id, creator_id=user.id, code_hash=hash_secret(raw_code), expires_at=expires_at
+            )
+        )
+        self.session.add(
+            AuditEvent(
+                team_id=user.team_id,
+                actor_user_id=user.id,
+                event_type="pairing_code.created",
+                metadata_={"expires_at": expires_at.isoformat()},
+            )
+        )
+        await self.session.commit()
+
+    async def consume_pairing_code(
+        self, raw_code: str, name: str, public_key: str, version: str, root_labels: list[str]
+    ):
+        now = utcnow()
+        code = await self.session.scalar(
+            select(PairingCode).where(PairingCode.code_hash == hash_secret(raw_code)).with_for_update()
+        )
+        if not code or code.consumed_at is not None or code.expires_at <= now:
+            await self.session.rollback()
+            raise PermissionError("pairing code is invalid, expired, or already used")
+        raw_credential = secrets.token_urlsafe(32)
+        device = Device(
+            team_id=code.team_id,
+            machine_id=hash_secret(public_key),
+            name=name,
+            runtime_version=version,
+            last_seen_at=now,
+        )
+        self.session.add(device)
+        await self.session.flush()
+        self.session.add(
+            DeviceCredential(team_id=code.team_id, device_id=device.id, credential_hash=hash_secret(raw_credential))
+        )
+        projects = []
+        for label in root_labels:
+            project = Project(team_id=code.team_id, device_id=device.id, root_id=str(uuid.uuid4()), display_name=label)
+            self.session.add(project)
+            await self.session.flush()
+            self.session.add(
+                ProjectGrant(team_id=code.team_id, project_id=project.id, user_id=code.creator_id, access_level="write")
+            )
+            projects.append(ProjectIdentity(project.id, device.id, project.root_id, project.display_name))
+        code.consumed_at = now
+        self.session.add(
+            AuditEvent(
+                team_id=code.team_id,
+                actor_user_id=code.creator_id,
+                device_id=device.id,
+                event_type="device.paired",
+                metadata_={"project_count": len(projects), "runtime_version": version},
+            )
+        )
+        await self.session.commit()
+        return self._device(device), raw_credential, projects
+
+    async def list_projects(self, user: UserIdentity) -> list[ProjectIdentity]:
+        rows = await self.session.scalars(
+            select(Project)
+            .join(ProjectGrant, ProjectGrant.project_id == Project.id)
+            .where(
+                Project.team_id == user.team_id, ProjectGrant.team_id == user.team_id, ProjectGrant.user_id == user.id
+            )
+            .order_by(Project.created_at)
+        )
+        return [ProjectIdentity(row.id, row.device_id, row.root_id, row.display_name) for row in rows]
+
+    async def list_devices(self, user: UserIdentity) -> list[DeviceResource]:
+        projects = await self.list_projects(user)
+        by_device: dict[uuid.UUID, list[ProjectIdentity]] = {}
+        for project in projects:
+            by_device.setdefault(project.device_id, []).append(project)
+        if not by_device:
+            return []
+        rows = await self.session.scalars(
+            select(Device)
+            .where(Device.team_id == user.team_id, Device.id.in_(by_device), Device.revoked_at.is_(None))
+            .order_by(Device.created_at)
+        )
+        return [
+            DeviceResource(row.id, row.name, row.runtime_version, row.last_seen_at, by_device[row.id]) for row in rows
+        ]
+
+    async def list_conversations(self, user: UserIdentity) -> list[ConversationIdentity]:
+        rows = await self.session.scalars(
+            select(Conversation)
+            .where(Conversation.team_id == user.team_id, Conversation.owner_id == user.id)
+            .order_by(Conversation.created_at)
+        )
+        return [ConversationIdentity(row.id, row.title, row.created_at) for row in rows]
+
+    async def create_conversation(self, user: UserIdentity, title: str) -> ConversationIdentity:
+        row = Conversation(team_id=user.team_id, owner_id=user.id, title=title)
+        self.session.add(row)
+        await self.session.commit()
+        await self.session.refresh(row)
+        return ConversationIdentity(row.id, row.title, row.created_at)
 
     async def create_session(self, user: UserIdentity, token: str, expires_at: datetime) -> None:
         self.session.add(
@@ -260,7 +398,7 @@ class PostgresStore:
         idempotency_key: str,
         prompt: str,
     ) -> tuple[TaskIdentity, bool]:
-        device = await self.session.get(Device, device_id)
+        device = await self.session.scalar(select(Device).where(Device.id == device_id).with_for_update())
         project = await self.session.get(Project, project_id)
         conversation = await self.session.get(Conversation, conversation_id)
         grant = await self.session.scalar(
@@ -284,6 +422,15 @@ class PostgresStore:
         )
         if existing:
             return self._task(existing), False
+        active = await self.session.scalar(
+            select(Task.id).where(
+                Task.team_id == user.team_id,
+                Task.device_id == device_id,
+                Task.status.in_([TaskStatus.pending, TaskStatus.running, TaskStatus.waiting_approval]),
+            )
+        )
+        if active:
+            raise RuntimeError("device already has an active task")
         model = Task(
             team_id=user.team_id,
             device_id=device_id,
@@ -785,6 +932,12 @@ class MemoryStore:
     approvals: dict[uuid.UUID, ApprovalIdentity] = field(default_factory=dict)
     rollbacks: dict[uuid.UUID, RollbackIdentity] = field(default_factory=dict)
     audit_events: dict[uuid.UUID, list[AuditIdentity]] = field(default_factory=dict)
+    pairing_codes: dict[str, tuple[UserIdentity, datetime, datetime | None]] = field(default_factory=dict)
+    device_metadata: dict[uuid.UUID, tuple[str, str | None, datetime | None]] = field(default_factory=dict)
+    project_names: dict[uuid.UUID, str] = field(default_factory=dict)
+    conversation_metadata: dict[uuid.UUID, tuple[uuid.UUID, str, datetime]] = field(default_factory=dict)
+    pairing_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    control_audit: list[tuple[uuid.UUID, str, dict[str, object]]] = field(default_factory=list)
 
     def _audit(self, task_id: uuid.UUID, event_type: str, metadata: dict[str, object] | None = None) -> None:
         self.audit_events.setdefault(task_id, []).append(
@@ -793,6 +946,75 @@ class MemoryStore:
 
     async def find_user(self, team_id: uuid.UUID, email: str) -> UserIdentity | None:
         return self.users.get((team_id, email))
+
+    async def create_pairing_code(self, user: UserIdentity, raw_code: str, expires_at: datetime) -> None:
+        self.pairing_codes[hash_secret(raw_code)] = (user, expires_at, None)
+        self.control_audit.append((user.team_id, "pairing_code.created", {"expires_at": expires_at.isoformat()}))
+
+    async def consume_pairing_code(
+        self, raw_code: str, name: str, public_key: str, version: str, root_labels: list[str]
+    ):
+        async with self.pairing_lock:
+            key = hash_secret(raw_code)
+            item = self.pairing_codes.get(key)
+            if not item or item[1] <= utcnow() or item[2] is not None:
+                raise PermissionError("pairing code is invalid, expired, or already used")
+            user = item[0]
+            self.pairing_codes[key] = (user, item[1], utcnow())
+            device = DeviceIdentity(uuid.uuid4(), user.team_id)
+            credential = secrets.token_urlsafe(32)
+            self.devices[device.id] = device
+            self.credentials[hash_secret(credential)] = (device.id, None, None)
+            self.device_metadata[device.id] = (name, version, utcnow())
+            projects = []
+            for label in root_labels:
+                project_id = uuid.uuid4()
+                root_id = str(uuid.uuid4())
+                self.projects[project_id] = (user.team_id, device.id, root_id)
+                self.project_names[project_id] = label
+                self.grants.add((user.id, project_id))
+                projects.append(ProjectIdentity(project_id, device.id, root_id, label))
+            self.control_audit.append(
+                (
+                    user.team_id,
+                    "device.paired",
+                    {"device_id": str(device.id), "project_count": len(projects), "runtime_version": version},
+                )
+            )
+            return device, credential, projects
+
+    async def list_projects(self, user: UserIdentity) -> list[ProjectIdentity]:
+        return [
+            ProjectIdentity(project_id, data[1], data[2], self.project_names.get(project_id, data[2]))
+            for project_id, data in self.projects.items()
+            if data[0] == user.team_id and (user.id, project_id) in self.grants
+        ]
+
+    async def list_devices(self, user: UserIdentity) -> list[DeviceResource]:
+        projects = await self.list_projects(user)
+        result = []
+        for device_id in {project.device_id for project in projects}:
+            device = self.devices[device_id]
+            if device.team_id != user.team_id or device.revoked_at is not None:
+                continue
+            name, version, last_seen = self.device_metadata.get(device_id, (str(device_id), None, None))
+            result.append(
+                DeviceResource(device_id, name, version, last_seen, [p for p in projects if p.device_id == device_id])
+            )
+        return result
+
+    async def list_conversations(self, user: UserIdentity) -> list[ConversationIdentity]:
+        return [
+            ConversationIdentity(cid, title, created)
+            for cid, (owner, title, created) in self.conversation_metadata.items()
+            if owner == user.id and self.conversations.get(cid) == user.team_id
+        ]
+
+    async def create_conversation(self, user: UserIdentity, title: str) -> ConversationIdentity:
+        conversation = ConversationIdentity(uuid.uuid4(), title, utcnow())
+        self.conversations[conversation.id] = user.team_id
+        self.conversation_metadata[conversation.id] = (user.id, title, conversation.created_at)
+        return conversation
 
     async def create_session(self, user: UserIdentity, token: str, expires_at: datetime) -> None:
         self.sessions[hash_secret(token)] = (user, expires_at, None)
@@ -822,7 +1044,8 @@ class MemoryStore:
         return device if device and device.revoked_at is None else None
 
     async def touch_device(self, device: DeviceIdentity, runtime_version: str | None) -> None:
-        return None
+        name, old_version, _ = self.device_metadata.get(device.id, (str(device.id), None, None))
+        self.device_metadata[device.id] = (name, runtime_version or old_version, utcnow())
 
     async def create_task(
         self,
@@ -847,6 +1070,13 @@ class MemoryStore:
         key = (user.team_id, device_id, idempotency_key)
         if key in self.idempotency:
             return self.tasks[self.idempotency[key]], False
+        if any(
+            task.team_id == user.team_id
+            and task.device_id == device_id
+            and task.status in {"pending", "running", "waiting_approval"}
+            for task in self.tasks.values()
+        ):
+            raise RuntimeError("device already has an active task")
         task_id = uuid.uuid4()
         task = TaskIdentity(
             task_id,

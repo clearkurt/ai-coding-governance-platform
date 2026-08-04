@@ -48,3 +48,7 @@ class DeviceConnectionRegistry:
             return False
         await websocket.send_json(payload)
         return True
+
+    async def is_online(self, device_id: uuid.UUID) -> bool:
+        async with self._lock:
+            return device_id in self._connections
