@@ -8,3 +8,7 @@ uploads/
 apps/agent/target/
 apps/agent/*.log
 runtime-check/
+apps/api-next/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
