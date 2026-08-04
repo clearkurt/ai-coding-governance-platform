@@ -24,6 +24,8 @@ The test computes the artifact hash, installs it into a temporary daemon-managed
 
 The second ignored test uses a one-shot localhost Responses stub and temporary command-auth helper. A real pinned App Server fetches the authenticated fixed company model catalog, starts a thread/turn, consumes the documented text streaming event sequence, and must emit the fixed text plus `turn/completed` without approval or workspace changes. This proves local Codex/Responses protocol compatibility, not DeepSeek behavior or model quality.
 
+That real test also verifies the minimum request-side `shell_command` function schema emitted by the pinned artifact without logging the request body or token. Its deterministic non-text phase drives one fixed temporary-workspace file write through the official Responses function-call stream, requires and explicitly accepts the real App Server approval, checks the matching tool-output continuation, syncs the shadow change through existing hash preconditions, then restores the pre-turn backup. It never calls an external model or approves network, hardware, or unrelated side effects. See [codex-tool-loop-contract-audit.md](../../docs/codex-tool-loop-contract-audit.md).
+
 ## Pairing
 
 ```powershell

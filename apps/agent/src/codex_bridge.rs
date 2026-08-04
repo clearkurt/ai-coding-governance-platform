@@ -817,7 +817,8 @@ fn main() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let stub = tokio::spawn(async move {
-            for _ in 0..4 {
+            let mut response_count = 0;
+            for _ in 0..6 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -862,8 +863,66 @@ fn main() {
                 assert_eq!(request_line, "post /v1/responses http/1.1");
                 assert!(headers.contains("authorization: bearer integration-short-token"));
                 let body: Value = serde_json::from_slice(&request[headers_end + 4..]).unwrap();
+                let tools = body["tools"]
+                    .as_array()
+                    .expect("Responses tools must be an array");
+                let shell = tools
+                    .iter()
+                    .find(|tool| tool["name"] == "shell_command")
+                    .expect("pinned Codex must declare shell_command");
+                assert_eq!(shell["type"], "function");
+                assert_eq!(shell["parameters"]["type"], "object");
+                assert_eq!(shell["parameters"]["required"], json!(["command"]));
+                assert_eq!(
+                    shell["parameters"]["properties"]["command"]["type"],
+                    "string"
+                );
+                assert_eq!(
+                    shell["parameters"]["properties"]["sandbox_permissions"]["enum"],
+                    json!(["use_default", "require_escalated"])
+                );
                 assert_eq!(body["model"], "deepseek-v4-flash");
                 assert_eq!(body["stream"], true);
+                if response_count == 0 {
+                    let arguments = json!({
+                        "command":"Set-Content -LiteralPath codex-approved.txt -Value APPROVED_STUB_CHANGE -NoNewline",
+                        "sandbox_permissions":"require_escalated",
+                        "justification":"Create the single deterministic integration fixture file in the temporary workspace."
+                    }).to_string();
+                    let item = json!({"id":"fc_local","call_id":"call_local","type":"function_call","status":"completed","name":"shell_command","arguments":arguments});
+                    let pending = json!({"id":"fc_local","call_id":"call_local","type":"function_call","status":"in_progress","name":"shell_command","arguments":""});
+                    let response = json!({"id":"resp_tool","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"deepseek-v4-flash","output":[item.clone()],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{"effort":null,"summary":null},"store":false,"temperature":null,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_p":null,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}});
+                    let events = vec![
+                        json!({"type":"response.created","sequence_number":0,"response":response.clone()}),
+                        json!({"type":"response.in_progress","sequence_number":1,"response":response.clone()}),
+                        json!({"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":pending}),
+                        json!({"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_local","output_index":0,"delta":arguments}),
+                        json!({"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fc_local","output_index":0,"arguments":item["arguments"]}),
+                        json!({"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":item}),
+                        json!({"type":"response.completed","sequence_number":6,"response":response}),
+                    ];
+                    let sse = events
+                        .into_iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect::<String>();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                    response_count += 1;
+                    continue;
+                }
+                assert!(
+                    body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output"
+                            && item["call_id"] == "call_local"
+                            && item["output"].is_string())
+                );
                 let response = json!({"id":"resp_local","object":"response","created_at":1,"status":"completed","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"deepseek-v4-flash","output":[{"id":"msg_local","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"LOCAL_STUB_OK"}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{"effort":null,"summary":null},"store":false,"temperature":null,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_p":null,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}});
                 let item_added = json!({"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_local","type":"message","status":"in_progress","role":"assistant","content":[]}});
                 let part = json!({"type":"output_text","annotations":[],"logprobs":[],"text":""});
@@ -903,6 +962,15 @@ fn main() {
         let workspace = base.join("workspace");
         fs::create_dir(&workspace).unwrap();
         fs::write(workspace.join("keep.txt"), b"unchanged").unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let backups = crate::backup::BackupStore::new(base.join("backups")).unwrap();
+        backups.create("tool-task", "root", &workspace).unwrap();
+        let shadow = crate::workspace::ShadowWorkspace::create(
+            &base.join("shadows"),
+            "tool-task",
+            &workspace,
+        )
+        .unwrap();
         let mut server = CodexAppServer::start(RuntimeConfig {
             managed_runtime_dir: base.join("runtime"),
             release,
@@ -913,20 +981,34 @@ fn main() {
         })
         .await
         .unwrap();
-        let thread = server.start_thread(&workspace).await.unwrap();
+        let thread = server.start_thread(&shadow.path).await.unwrap();
         server
             .start_turn(
                 &thread,
-                &workspace,
-                "Reply with exactly LOCAL_STUB_OK. Do not use tools or modify files.",
+                &shadow.path,
+                "Create only codex-approved.txt in this temporary workspace, then reply LOCAL_STUB_OK.",
             )
             .await
             .unwrap();
         let mut text = String::new();
-        tokio::time::timeout(Duration::from_secs(30),async { loop { tokio::select! { Some(notification)=server.notifications.recv()=>{ if notification.method.contains("agentMessage") { if let Some(delta)=notification.params["delta"].as_str(){text.push_str(delta)} } if notification.method=="turn/completed" {break} }, Some(request)=server.server_requests.recv()=>panic!("unexpected approval request {}",request.method), else=>panic!("Codex streams closed") } } }).await.unwrap();
+        let mut approved = false;
+        tokio::time::timeout(Duration::from_secs(30),async { loop { tokio::select! { Some(notification)=server.notifications.recv()=>{ if notification.method.contains("agentMessage") { if let Some(delta)=notification.params["delta"].as_str(){text.push_str(delta)} } if notification.method=="turn/completed" {break} }, Some(request)=server.server_requests.recv()=>{ assert!(!approved,"only one approval is allowed"); assert_eq!(request.method,"item/commandExecution/requestApproval"); let rendered=request.params.to_string(); assert!(rendered.contains("codex-approved.txt")); assert!(!rendered.contains("http://")&&!rendered.contains("https://")&&!rendered.to_ascii_lowercase().contains("flash")); server.respond(request.id,Ok(json!({"decision":"accept"}))).await.unwrap(); approved=true; }, else=>panic!("Codex streams closed") } } }).await.unwrap();
+        assert!(approved);
         assert!(text.contains("LOCAL_STUB_OK"));
         assert_eq!(fs::read(workspace.join("keep.txt")).unwrap(), b"unchanged");
-        assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
+        assert!(!workspace.join("codex-approved.txt").exists());
+        assert_eq!(
+            fs::read(shadow.path.join("codex-approved.txt")).unwrap(),
+            b"APPROVED_STUB_CHANGE"
+        );
+        shadow.sync_back(&workspace).unwrap();
+        assert_eq!(
+            fs::read(workspace.join("codex-approved.txt")).unwrap(),
+            b"APPROVED_STUB_CHANGE"
+        );
+        backups.rollback("tool-task", "root", &workspace).unwrap();
+        assert!(!workspace.join("codex-approved.txt").exists());
+        assert_eq!(fs::read(workspace.join("keep.txt")).unwrap(), b"unchanged");
         server.shutdown().await.unwrap();
         stub.await.unwrap();
         let _ = fs::remove_dir_all(base);
