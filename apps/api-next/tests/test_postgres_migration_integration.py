@@ -67,6 +67,31 @@ def _tool_major(command: list[str]) -> int:
     return int(match.group(1))
 
 
+def _postgres_tool_env(command: list[str], password: str) -> dict[str, str]:
+    environment = {**os.environ, "PGPASSWORD": password}
+    if Path(command[0]).name.lower() not in {"wsl", "wsl.exe"}:
+        return environment
+    entries = [entry for entry in environment.get("WSLENV", "").split(":") if entry]
+    names = {entry.split("/", 1)[0].upper() for entry in entries}
+    if "PGPASSWORD" not in names:
+        entries.append("PGPASSWORD")
+    environment["WSLENV"] = ":".join(entries)
+    return environment
+
+
+def _run_postgres_tool(command: list[str], password: str, **kwargs) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(command, env=_postgres_tool_env(command, password), check=True, timeout=120, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"{command[-1]} timed out after 120 seconds") from None
+    except subprocess.CalledProcessError as error:
+        summary = (error.stderr or b"").decode("utf-8", errors="replace").replace(password, "[redacted]").strip()
+        if len(summary) > 500:
+            summary = f"{summary[:500]}..."
+        detail = f": {summary}" if summary else ""
+        raise AssertionError(f"{command[-1]} failed with exit code {error.returncode}{detail}") from None
+
+
 def _credential_free_url_and_password(url: str) -> tuple[str, str]:
     parsed = make_url(url)
     username = quote(parsed.username or "", safe="")
@@ -120,6 +145,46 @@ def test_postgres_tool_version_decodes_non_locale_bytes(monkeypatch: pytest.Monk
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert _tool_major(["wsl", "--", "pg_dump"]) == 16
+
+
+@pytest.mark.parametrize("existing", [None, "FOO/u:BAR/p"])
+def test_postgres_tool_env_adds_password_to_wslenv(monkeypatch: pytest.MonkeyPatch, existing: str | None) -> None:
+    if existing is None:
+        monkeypatch.delenv("WSLENV", raising=False)
+    else:
+        monkeypatch.setenv("WSLENV", existing)
+
+    environment = _postgres_tool_env(["wsl.exe", "--", "pg_dump"], "secret")
+
+    assert environment["PGPASSWORD"] == "secret"
+    assert environment["WSLENV"] == ("PGPASSWORD" if existing is None else f"{existing}:PGPASSWORD")
+
+
+def test_postgres_tool_env_preserves_existing_password_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WSLENV", "FOO:PGPASSWORD/u:BAR")
+
+    environment = _postgres_tool_env(["wsl", "--", "pg_restore"], "secret")
+
+    assert environment["WSLENV"] == "FOO:PGPASSWORD/u:BAR"
+
+
+def test_postgres_tool_env_does_not_change_wslenv_for_native_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WSLENV", "FOO/u")
+
+    environment = _postgres_tool_env([r"C:\PostgreSQL\bin\pg_dump.exe"], "secret")
+
+    assert environment["WSLENV"] == "FOO/u"
+    assert environment["PGPASSWORD"] == "secret"
+
+
+def test_postgres_tool_error_redacts_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(2, ["wsl", "--", "pg_dump"], stderr=b"password secret was rejected")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AssertionError, match=r"pg_dump failed with exit code 2: password \[redacted\] was rejected"):
+        _run_postgres_tool(["wsl", "--", "pg_dump"], "secret", capture_output=True)
 
 
 @pytest.fixture
@@ -658,26 +723,20 @@ def test_postgres_custom_backup_restore_preserves_pending_control_plane_state(
         restored_cli_url, restored_password = _credential_free_url_and_password(restored_url)
         with tempfile.TemporaryDirectory(prefix="company-agent-pg-backup-") as temporary:
             dump_path = Path(temporary) / "control-plane.dump"
-            dump_env = {**os.environ, "PGPASSWORD": source_password}
             with dump_path.open("wb") as dump_file:
-                subprocess.run(
+                _run_postgres_tool(
                     [*pg_dump, "--format=custom", "--no-owner", "--dbname", source_cli_url],
-                    env=dump_env,
+                    source_password,
                     stdout=dump_file,
                     stderr=subprocess.PIPE,
-                    check=True,
-                    timeout=120,
                 )
             assert dump_path.stat().st_size > 0
-            restore_env = {**os.environ, "PGPASSWORD": restored_password}
             with dump_path.open("rb") as dump_file:
-                subprocess.run(
+                _run_postgres_tool(
                     [*pg_restore, "--no-owner", "--exit-on-error", "--dbname", restored_cli_url],
-                    env=restore_env,
+                    restored_password,
                     stdin=dump_file,
                     capture_output=True,
-                    check=True,
-                    timeout=120,
                 )
 
         restored_schema = asyncio.run(_inspect_database(restored_url))
