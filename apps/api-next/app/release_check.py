@@ -33,7 +33,7 @@ def main() -> int:
     if not schema_ready:
         print("release check failed: database schema unsupported")
         return 1
-    print("release check passed")
+    print(f"release check passed (rollout mode: {settings.codex_rollout_mode})")
     return 0
 
 

@@ -1,4 +1,5 @@
 import os
+import uuid
 
 import pytest
 from pydantic import ValidationError
@@ -86,6 +87,34 @@ def test_log_level_is_normalized_and_restricted() -> None:
     assert Settings(**(VALID_PRODUCTION | {"log_level": "warning"})).log_level == "WARNING"
     with pytest.raises(ValidationError):
         Settings(**(VALID_PRODUCTION | {"log_level": "verbose"}))
+
+
+def test_production_rollout_defaults_disabled_and_allowlist_is_strict() -> None:
+    device = uuid.uuid4()
+    assert not Settings(**VALID_PRODUCTION).allows_new_codex_task(device)
+    with pytest.raises(ValidationError):
+        Settings(**(VALID_PRODUCTION | {"codex_rollout_mode": "allowlist"}))
+
+    allowlisted = Settings(
+        **(VALID_PRODUCTION | {"codex_rollout_mode": "allowlist", "codex_rollout_device_ids": [device, device]})
+    )
+    assert allowlisted.codex_rollout_device_ids == {device}
+    assert allowlisted.allows_new_codex_task(device)
+    assert not allowlisted.allows_new_codex_task(uuid.uuid4())
+    assert Settings(**(VALID_PRODUCTION | {"codex_rollout_mode": "all"})).allows_new_codex_task(device)
+
+
+def test_rollout_allowlist_has_bounded_size() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            **(
+                VALID_PRODUCTION
+                | {
+                    "codex_rollout_mode": "allowlist",
+                    "codex_rollout_device_ids": [uuid.uuid4() for _ in range(1001)],
+                }
+            )
+        )
 
 
 def test_settings_reject_non_postgres_database() -> None:

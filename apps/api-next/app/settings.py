@@ -1,3 +1,4 @@
+import uuid
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
@@ -20,11 +21,20 @@ class Settings(BaseSettings):
     responses_max_concurrency: int = Field(default=32, ge=1, le=256)
     model_token_ttl_seconds: int = Field(default=300, ge=30, le=3600)
     model_daily_token_quota_per_team: int = Field(default=1_000_000, ge=1, le=1_000_000_000)
+    codex_rollout_mode: Literal["disabled", "allowlist", "all"] = "disabled"
+    codex_rollout_device_ids: frozenset[uuid.UUID] = Field(default_factory=frozenset)
 
     @field_validator("log_level", mode="before")
     @classmethod
     def normalize_log_level(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("codex_rollout_device_ids", mode="after")
+    @classmethod
+    def limit_rollout_allowlist(cls, value: frozenset[uuid.UUID]) -> frozenset[uuid.UUID]:
+        if len(value) > 1000:
+            raise ValueError("Codex rollout allowlist cannot exceed 1000 devices")
+        return value
 
     @model_validator(mode="after")
     def validate_deployment_boundary(self) -> "Settings":
@@ -33,6 +43,8 @@ class Settings(BaseSettings):
             raise ValueError("DeepSeek base URL must be an HTTP(S) origin without embedded credentials")
         if self.environment != "production":
             return self
+        if self.codex_rollout_mode == "allowlist" and not self.codex_rollout_device_ids:
+            raise ValueError("production allowlist rollout requires at least one device")
         if not self.session_cookie_secure:
             raise ValueError("production requires secure session cookies")
         if upstream.scheme != "https":
@@ -50,6 +62,13 @@ class Settings(BaseSettings):
         ):
             raise ValueError("production requires a non-placeholder DeepSeek API key of at least 32 characters")
         return self
+
+    def allows_new_codex_task(self, device_id: uuid.UUID) -> bool:
+        if self.environment != "production":
+            return True
+        if self.codex_rollout_mode == "all":
+            return True
+        return self.codex_rollout_mode == "allowlist" and device_id in self.codex_rollout_device_ids
 
 
 @lru_cache

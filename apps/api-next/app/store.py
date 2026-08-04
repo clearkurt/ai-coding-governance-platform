@@ -155,6 +155,9 @@ class Store(Protocol):
         idempotency_key: str,
         prompt: str,
     ) -> tuple[TaskIdentity, bool]: ...
+    async def can_create_task(
+        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID
+    ) -> bool: ...
     async def get_task_for_user(self, task_id: uuid.UUID, user: UserIdentity) -> TaskIdentity | None: ...
     async def append_event(
         self,
@@ -388,6 +391,27 @@ class PostgresStore:
         if runtime_version:
             model.runtime_version = runtime_version
         await self.session.commit()
+
+    async def can_create_task(
+        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID
+    ) -> bool:
+        permitted = await self.session.scalar(
+            select(ProjectGrant.id)
+            .join(Project, Project.id == ProjectGrant.project_id)
+            .join(Device, Device.id == Project.device_id)
+            .join(Conversation, Conversation.id == conversation_id)
+            .where(
+                ProjectGrant.team_id == user.team_id,
+                ProjectGrant.user_id == user.id,
+                ProjectGrant.project_id == project_id,
+                Project.team_id == user.team_id,
+                Project.device_id == device_id,
+                Device.team_id == user.team_id,
+                Device.revoked_at.is_(None),
+                Conversation.team_id == user.team_id,
+            )
+        )
+        return permitted is not None
 
     async def create_task(
         self,
@@ -1046,6 +1070,21 @@ class MemoryStore:
     async def touch_device(self, device: DeviceIdentity, runtime_version: str | None) -> None:
         name, old_version, _ = self.device_metadata.get(device.id, (str(device.id), None, None))
         self.device_metadata[device.id] = (name, runtime_version or old_version, utcnow())
+
+    async def can_create_task(
+        self, user: UserIdentity, device_id: uuid.UUID, project_id: uuid.UUID, conversation_id: uuid.UUID
+    ) -> bool:
+        device = self.devices.get(device_id)
+        project = self.projects.get(project_id)
+        return bool(
+            device
+            and project
+            and device.team_id == user.team_id
+            and device.revoked_at is None
+            and project[:2] == (user.team_id, device_id)
+            and self.conversations.get(conversation_id) == user.team_id
+            and (user.id, project_id) in self.grants
+        )
 
     async def create_task(
         self,

@@ -25,6 +25,7 @@ from app.db.models import TaskEvent, Team, User
 from app.device_registry import DeviceConnectionRegistry
 from app.main import app, websocket_store
 from app.security import utcnow
+from app.settings import Settings
 from app.store import PostgresStore
 
 ADMIN_URL_ENV = "COMPANY_AGENT_TEST_POSTGRES_ADMIN_URL"
@@ -885,6 +886,49 @@ def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_post
         for arguments in commands:
             _run_openssl(wsl, arguments)
         asyncio.run(exercise(server_certificate, server_key, ca_certificate))
+
+
+@pytest.mark.integration
+def test_postgres_rollout_disable_preserves_pending_delivery(migrated_postgres_url: str) -> None:
+    async def exercise() -> None:
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as session:
+                team = Team(slug=f"rollout-{uuid.uuid4().hex}", name="Rollout")
+                session.add(team)
+                await session.flush()
+                user = User(team_id=team.id, email="rollout@example.test", password_hash="hash")
+                session.add(user)
+                await session.flush()
+                team_id, email = team.id, user.email
+                await session.commit()
+                store = PostgresStore(session)
+                identity = await store.find_user(team_id, email)
+                await store.create_pairing_code(identity, "rollout-pair", utcnow() + timedelta(minutes=5))
+                device, _, projects = await store.consume_pairing_code(
+                    "rollout-pair", "rollout-device", "rollout-key", "runtime", ["Rollout project"]
+                )
+                conversation = await store.create_conversation(identity, "Rollout conversation")
+                assert await store.can_create_task(identity, device.id, projects[0].id, conversation.id)
+                task, _ = await store.create_task(
+                    identity, device.id, projects[0].id, conversation.id, "rollout-task", "prompt"
+                )
+            disabled = Settings(
+                database_url=migrated_postgres_url,
+                environment="production",
+                session_cookie_secure=True,
+                deepseek_api_key="production-secret-value-that-is-long-enough",
+                deepseek_base_url="https://api.deepseek.com",
+            )
+            assert not disabled.allows_new_codex_task(device.id)
+            async with sessions() as session:
+                pending = await PostgresStore(session).pending_tasks_for_device(device)
+                assert [(item.id, item.delivery_id) for item in pending] == [(task.id, task.delivery_id)]
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.integration

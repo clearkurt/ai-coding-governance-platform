@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic.config import Config
@@ -72,7 +73,7 @@ def test_release_check_reports_only_supported_schema_state(
         return schema_ready
 
     monkeypatch.setattr(release_check, "validate_configuration", lambda: (True, []))
-    monkeypatch.setattr(release_check, "Settings", lambda: object())
+    monkeypatch.setattr(release_check, "Settings", lambda: SimpleNamespace(codex_rollout_mode="disabled"))
     monkeypatch.setattr(release_check, "check_online_schema", fake_check)
 
     assert release_check.main() == exit_code
@@ -86,7 +87,7 @@ def test_release_check_database_error_does_not_leak_details(
         raise SQLAlchemyError("postgresql://user:secret@db/private")
 
     monkeypatch.setattr(release_check, "validate_configuration", lambda: (True, []))
-    monkeypatch.setattr(release_check, "Settings", lambda: object())
+    monkeypatch.setattr(release_check, "Settings", lambda: SimpleNamespace(codex_rollout_mode="disabled"))
     monkeypatch.setattr(release_check, "check_online_schema", fail_check)
 
     assert release_check.main() == 1

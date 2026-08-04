@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import os
 import uuid
 from datetime import timedelta
@@ -16,6 +17,7 @@ from app.dependencies import get_store
 from app.main import app, websocket_store
 from app.model_proxy import get_model_http_client
 from app.security import hash_password, hash_secret, utcnow
+from app.settings import Settings
 from app.sse import replay_and_follow
 from app.store import DeviceIdentity, MemoryStore, UserIdentity
 
@@ -185,6 +187,52 @@ def test_cross_team_task_is_rejected_and_requests_are_idempotent(client, seeded_
     assert first.json()["id"] == second.json()["id"]
     competing = client.post("/tasks", headers=headers, json={**body, "idempotency_key": "competing"})
     assert competing.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("mode", "listed", "expected"),
+    [("disabled", False, 503), ("allowlist", False, 503), ("allowlist", True, 201), ("all", False, 201)],
+)
+def test_production_rollout_gates_only_authorized_new_tasks(
+    client, seeded_store, monkeypatch: pytest.MonkeyPatch, mode: str, listed: bool, expected: int
+):
+    store, user, _, device, other_device, project, other_project, conversation, other_conversation = seeded_store
+    allowlist = [device.id] if listed else [uuid.uuid4()]
+    settings = Settings(
+        database_url="postgresql+asyncpg://agent:test@db.internal:5432/agent",
+        environment="production",
+        session_cookie_secure=True,
+        deepseek_api_key="production-secret-value-that-is-long-enough",
+        deepseek_base_url="https://api.deepseek.com",
+        codex_rollout_mode=mode,
+        codex_rollout_device_ids=allowlist,
+    )
+    monkeypatch.setattr(importlib.import_module("app.main"), "get_settings", lambda: settings)
+    headers = session_headers(store, user)
+    body = {
+        "device_id": str(device.id),
+        "project_id": str(project),
+        "conversation_id": str(conversation),
+        "idempotency_key": f"rollout-{mode}-{listed}",
+        "prompt": "rollout task",
+    }
+
+    response = client.post("/tasks", headers=headers, json=body)
+    assert response.status_code == expected
+    if expected == 503:
+        assert response.json() == {"detail": "new Codex tasks are temporarily unavailable"}
+    cross_team = client.post(
+        "/tasks",
+        headers=headers,
+        json={
+            **body,
+            "device_id": str(other_device.id),
+            "project_id": str(other_project),
+            "conversation_id": str(other_conversation),
+            "idempotency_key": "rollout-cross-team",
+        },
+    )
+    assert cross_team.status_code == 403
 
 
 def test_device_websocket_auth_event_deduplication_and_sse_replay(client, seeded_store):

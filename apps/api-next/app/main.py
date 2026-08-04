@@ -327,6 +327,14 @@ async def create_task(
     user: UserIdentity = Depends(current_user),
     store: Store = Depends(get_store),
 ) -> TaskOut:
+    if not await store.can_create_task(user, body.device_id, body.project_id, body.conversation_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="project, device, or conversation is not available"
+        )
+    if not get_settings().allows_new_codex_task(body.device_id):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="new Codex tasks are temporarily unavailable"
+        )
     try:
         task, created = await store.create_task(
             user, body.device_id, body.project_id, body.conversation_id, body.idempotency_key, body.prompt
