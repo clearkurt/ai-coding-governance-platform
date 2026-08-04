@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -644,6 +645,192 @@ def test_uvicorn_process_restart_replays_unacknowledged_delivery(migrated_postgr
             await engine.dispose()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.integration
+def test_uvicorn_tls_wss_validates_ca_hostname_and_delivery_replay(migrated_postgres_url: str) -> None:
+    wsl = shutil.which("wsl")
+    if not wsl:
+        pytest.skip("wsl with OpenSSL is required to generate temporary TLS integration certificates")
+    openssl_probe = subprocess.run(
+        [wsl, "-d", "Ubuntu-24.04", "--", "openssl", "version"], capture_output=True, check=False, timeout=15
+    )
+    if openssl_probe.returncode != 0:
+        pytest.skip("OpenSSL is unavailable in the Ubuntu-24.04 WSL distribution")
+
+    async def exercise(certificate: Path, private_key: Path, ca_certificate: Path) -> None:
+        import websockets
+
+        engine = create_async_engine(migrated_postgres_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            team = Team(slug=f"tls-{uuid.uuid4().hex}", name="TLS")
+            session.add(team)
+            await session.flush()
+            user = User(team_id=team.id, email="tls@example.test", password_hash="hash")
+            session.add(user)
+            await session.flush()
+            team_id, email = team.id, user.email
+            await session.commit()
+            store = PostgresStore(session)
+            identity = await store.find_user(team_id, email)
+            await store.create_pairing_code(identity, "tls-pair", utcnow() + timedelta(minutes=5))
+            device, credential, projects = await store.consume_pairing_code(
+                "tls-pair", "tls-device", "tls-key", "runtime", ["TLS project"]
+            )
+            conversation = await store.create_conversation(identity, "TLS conversation")
+            task, _ = await store.create_task(
+                identity, device.id, projects[0].id, conversation.id, "tls-task", "prompt"
+            )
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        environment = {**os.environ, "COMPANY_AGENT_DATABASE_URL": migrated_postgres_url}
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--ssl-certfile",
+            str(certificate),
+            "--ssl-keyfile",
+            str(private_key),
+            "--log-level",
+            "warning",
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(200):
+                if process.returncode is not None:
+                    raise RuntimeError("TLS uvicorn child exited during startup")
+                try:
+                    _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.close()
+                    await writer.wait_closed()
+                    break
+                except OSError:
+                    await asyncio.sleep(0.01)
+            else:
+                raise TimeoutError("TLS uvicorn child did not start")
+
+            uri = f"wss://127.0.0.1:{port}/ws/devices"
+            auth = {"type": "authenticate", "device_id": str(device.id), "credential": credential}
+            trusted = ssl.create_default_context(cafile=str(ca_certificate))
+            with pytest.raises(ssl.SSLCertVerificationError):
+                async with websockets.connect(uri, ssl=ssl.create_default_context(), open_timeout=5):
+                    pass
+            with pytest.raises(ssl.SSLCertVerificationError):
+                async with websockets.connect(uri, ssl=trusted, server_hostname="localhost", open_timeout=5):
+                    pass
+
+            async with websockets.connect(uri, ssl=trusted, open_timeout=5) as websocket:
+                await websocket.send(json.dumps(auth))
+                assert json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))["type"] == "authenticated"
+                first_delivery = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+            async with websockets.connect(uri, ssl=trusted, open_timeout=5) as websocket:
+                await websocket.send(json.dumps(auth))
+                assert json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))["type"] == "authenticated"
+                replay = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                assert replay["task_id"] == first_delivery["task_id"] == str(task.id)
+                assert replay["delivery_id"] == first_delivery["delivery_id"] == task.delivery_id
+                await websocket.send(
+                    json.dumps({"type": "task.dispatch.ack", "task_id": str(task.id), "delivery_id": task.delivery_id})
+                )
+                assert json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))["accepted"] is True
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+            await engine.dispose()
+
+    with tempfile.TemporaryDirectory(prefix="company-agent-tls-") as temporary:
+        tls_directory = Path(temporary)
+        extension = tls_directory / "server.ext"
+        extension.write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n", encoding="utf-8")
+
+        def wsl_path(path: Path) -> str:
+            result = subprocess.run(
+                [wsl, "-d", "Ubuntu-24.04", "--", "wslpath", "-a", str(path)],
+                capture_output=True,
+                check=True,
+                timeout=15,
+            )
+            return result.stdout.decode("utf-8", errors="strict").strip()
+
+        ca_key, ca_certificate = tls_directory / "ca.key", tls_directory / "ca.crt"
+        server_key, server_request = tls_directory / "server.key", tls_directory / "server.csr"
+        server_certificate = tls_directory / "server.crt"
+        commands = [
+            [
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                wsl_path(ca_key),
+                "-out",
+                wsl_path(ca_certificate),
+                "-days",
+                "1",
+                "-sha256",
+                "-subj",
+                "/CN=Company Agent Test CA",
+            ],
+            [
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                wsl_path(server_key),
+                "-out",
+                wsl_path(server_request),
+                "-sha256",
+                "-subj",
+                "/CN=127.0.0.1",
+            ],
+            [
+                "x509",
+                "-req",
+                "-in",
+                wsl_path(server_request),
+                "-CA",
+                wsl_path(ca_certificate),
+                "-CAkey",
+                wsl_path(ca_key),
+                "-CAcreateserial",
+                "-out",
+                wsl_path(server_certificate),
+                "-days",
+                "1",
+                "-sha256",
+                "-extfile",
+                wsl_path(extension),
+            ],
+        ]
+        for arguments in commands:
+            subprocess.run(
+                [wsl, "-d", "Ubuntu-24.04", "--", "openssl", *arguments],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=30,
+            )
+        asyncio.run(exercise(server_certificate, server_key, ca_certificate))
 
 
 @pytest.mark.integration
