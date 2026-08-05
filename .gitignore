@@ -8,3 +8,10 @@ uploads/
 apps/agent/target/
 apps/agent/*.log
 runtime-check/
+apps/api-next/.venv/
+apps/web-next/test-results/
+apps/web-next/playwright-report/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/docs/handoff.md

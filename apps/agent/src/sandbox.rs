@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -16,52 +16,135 @@ use tokio::{
 use crate::Root;
 
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
-const BLOCKED_NAMES: &[&str] = &[".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"];
+const BLOCKED_NAMES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
+    "id_rsa",
+    "id_ed25519",
+];
 const MAX_COMMAND_LEN: usize = 2000;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 const ALLOWED_PROGRAMS: &[&str] = &[
-    "git", "npm", "pnpm", "yarn", "node", "cargo", "rustc", "go", "dotnet", "java", "javac", "python", "py", "rg", "ls",
-    "dir", "find", "findstr", "pwd", "tree", "where", "cmake", "make", "ninja", "mvn", "gradle", "gcc", "g++", "clang",
-    "clang++", "tsc", "eslint", "prettier",
+    "git", "npm", "pnpm", "yarn", "node", "cargo", "rustc", "go", "dotnet", "java", "javac",
+    "python", "py", "rg", "ls", "dir", "find", "findstr", "pwd", "tree", "where", "cmake", "make",
+    "ninja", "mvn", "gradle", "gcc", "g++", "clang", "clang++", "tsc", "eslint", "prettier",
 ];
 const DENIED_PROGRAMS: &[&str] = &[
-    "cmd", "powershell", "pwsh", "bash", "sh", "zsh", "wsl", "rm", "del", "erase", "rmdir", "rd", "remove-item", "curl",
-    "wget", "iwr", "invoke-webrequest", "ping", "taskkill", "start-process", "reset", "npx", "docker", "docker-compose",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "bash",
+    "sh",
+    "zsh",
+    "wsl",
+    "rm",
+    "del",
+    "erase",
+    "rmdir",
+    "rd",
+    "remove-item",
+    "curl",
+    "wget",
+    "iwr",
+    "invoke-webrequest",
+    "ping",
+    "taskkill",
+    "start-process",
+    "reset",
+    "npx",
+    "docker",
+    "docker-compose",
 ];
 const DENIED_GIT_SUBCOMMANDS: &[&str] = &[
-    "reset", "clean", "push", "clone", "restore", "rm", "mv", "gc", "prune", "filter-branch", "reflog", "replace",
+    "reset",
+    "clean",
+    "push",
+    "clone",
+    "restore",
+    "rm",
+    "mv",
+    "gc",
+    "prune",
+    "filter-branch",
+    "reflog",
+    "replace",
 ];
 const AUTO_GIT_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "remote", "ls-files", "grep", "rev-parse", "tag", "stash", "describe",
-    "shortlog", "blame", "config",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "remote",
+    "ls-files",
+    "grep",
+    "rev-parse",
+    "tag",
+    "stash",
+    "describe",
+    "shortlog",
+    "blame",
+    "config",
 ];
 const APPROVAL_GIT_SUBCOMMANDS: &[&str] = &[
-    "add", "commit", "merge", "rebase", "cherry-pick", "revert", "fetch", "pull", "checkout", "switch", "init", "apply",
-    "archive", "notes", "submodule", "worktree",
+    "add",
+    "commit",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "fetch",
+    "pull",
+    "checkout",
+    "switch",
+    "init",
+    "apply",
+    "archive",
+    "notes",
+    "submodule",
+    "worktree",
 ];
 const AUTO_BUILD_TEST_SCRIPTS: &[&str] = &["test", "build", "lint", "typecheck", "check"];
 const LONG_RUNNING_SCRIPTS: &[&str] = &["dev", "start", "serve", "watch", "preview", "storybook"];
 const NPM_NETWORK_SUBCOMMANDS: &[&str] = &[
-    "install", "i", "add", "ci", "update", "outdated", "audit", "uninstall", "remove", "rebuild", "dedupe",
+    "install",
+    "i",
+    "add",
+    "ci",
+    "update",
+    "outdated",
+    "audit",
+    "uninstall",
+    "remove",
+    "rebuild",
+    "dedupe",
 ];
 const NPM_PUBLISH_SUBCOMMANDS: &[&str] = &["publish", "login", "logout", "whoami"];
 const CARGO_NETWORK_SUBCOMMANDS: &[&str] = &["update", "search", "add", "remove"];
 const CARGO_DENIED_SUBCOMMANDS: &[&str] = &["install", "publish"];
 const AUTO_LIST_PROGRAMS: &[&str] = &["ls", "dir", "rg", "find", "findstr", "pwd", "tree", "where"];
 const VERSION_PROGRAMS: &[&str] = &[
-    "git", "npm", "pnpm", "yarn", "node", "cargo", "rustc", "python", "py", "go", "dotnet", "java", "tsc", "eslint",
-    "prettier", "mvn", "gradle", "cmake", "ninja",
+    "git", "npm", "pnpm", "yarn", "node", "cargo", "rustc", "python", "py", "go", "dotnet", "java",
+    "tsc", "eslint", "prettier", "mvn", "gradle", "cmake", "ninja",
 ];
 
-fn digest(value: &[u8]) -> String { format!("{:x}", Sha256::digest(value)) }
+fn digest(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
 
 fn validate_approval_token(payload: &Value) -> Result<()> {
     let token = payload["approvalToken"].as_str().context("缺少审批令牌")?;
-    let token_hash = payload["approvalTokenHash"].as_str().context("缺少审批令牌哈希")?;
-    if token.len() < 16 || token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let token_hash = payload["approvalTokenHash"]
+        .as_str()
+        .context("缺少审批令牌哈希")?;
+    if token.len() < 16
+        || token_hash.len() != 64
+        || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         bail!("审批令牌无效，拒绝执行");
     }
     if digest(token.as_bytes()) != token_hash {
@@ -71,17 +154,30 @@ fn validate_approval_token(payload: &Value) -> Result<()> {
 }
 
 fn root<'a>(roots: &'a [Root], id: &str) -> Result<&'a Root> {
-    roots.iter().find(|root| root.id == id).context("未授权的项目根目录")
+    roots
+        .iter()
+        .find(|root| root.id == id)
+        .context("未授权的项目根目录")
 }
 
 fn safe_path(root: &Root, relative: &str) -> Result<PathBuf> {
     let candidate = Path::new(relative);
-    if candidate.is_absolute() || candidate.components().any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))) {
+    if candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
         bail!("路径越界：仅允许访问授权项目目录内的文件")
     }
-    let resolved = fs::canonicalize(root.path.join(candidate)).or_else(|_| Ok::<PathBuf, std::io::Error>(root.path.join(candidate)))?;
+    let resolved = fs::canonicalize(root.path.join(candidate))
+        .or_else(|_| Ok::<PathBuf, std::io::Error>(root.path.join(candidate)))?;
     let base = fs::canonicalize(&root.path)?;
-    if !resolved.starts_with(&base) { bail!("路径越界（含符号链接逃逸）：仅允许访问授权项目目录内的文件") }
+    if !resolved.starts_with(&base) {
+        bail!("路径越界（含符号链接逃逸）：仅允许访问授权项目目录内的文件")
+    }
     Ok(resolved)
 }
 
@@ -90,11 +186,31 @@ fn verify_file(path: &Path) -> Result<()> {
         Ok(value) => value,
         Err(_) => bail!("文件不存在：{}", path.display()),
     };
-    if !metadata.is_file() { bail!("不是普通文件（目录或特殊文件）：{}", path.display()) }
-    if metadata.len() > MAX_BYTES { bail!("文件超过 {} MB 大小限制，无法读取：{}", MAX_BYTES / 1024 / 1024, path.display()) }
-    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-    if BLOCKED_NAMES.iter().any(|blocked| name.eq_ignore_ascii_case(blocked)) || name.ends_with(".pem") || name.ends_with(".key") || name.ends_with(".p12") {
-        bail!("出于安全考虑，禁止访问 .env、私钥等敏感文件：{}", path.display())
+    if !metadata.is_file() {
+        bail!("不是普通文件（目录或特殊文件）：{}", path.display())
+    }
+    if metadata.len() > MAX_BYTES {
+        bail!(
+            "文件超过 {} MB 大小限制，无法读取：{}",
+            MAX_BYTES / 1024 / 1024,
+            path.display()
+        )
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if BLOCKED_NAMES
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+    {
+        bail!(
+            "出于安全考虑，禁止访问 .env、私钥等敏感文件：{}",
+            path.display()
+        )
     }
     Ok(())
 }
@@ -116,7 +232,9 @@ fn list(root: &Root, payload: &Value) -> Result<Value> {
     let start = safe_path(root, payload["relativePath"].as_str().unwrap_or(""))?;
     let mut entries = Vec::new();
     for entry in fs::read_dir(start)? {
-        if entries.len() >= 500 { break; }
+        if entries.len() >= 500 {
+            break;
+        }
         let entry = entry?;
         let metadata = entry.metadata()?;
         entries.push(json!({"name": entry.file_name().to_string_lossy(), "directory": metadata.is_dir(), "size": if metadata.is_file() { metadata.len() } else { 0 }}));
@@ -129,7 +247,8 @@ fn read(root: &Root, payload: &Value) -> Result<Value> {
     let path = safe_path(root, relative)?;
     verify_file(&path)?;
     let bytes = fs::read(&path)?;
-    let content = String::from_utf8(bytes.clone()).map_err(|_| anyhow::anyhow!("文件不是 UTF-8 编码的文本，无法读取：{}", path.display()))?;
+    let content = String::from_utf8(bytes.clone())
+        .map_err(|_| anyhow::anyhow!("文件不是 UTF-8 编码的文本，无法读取：{}", path.display()))?;
     Ok(json!({"relativePath": relative, "content": content, "sha256": digest(&bytes)}))
 }
 
@@ -138,12 +257,20 @@ fn stage(root: &Root, payload: &Value) -> Result<Value> {
     let path = safe_path(root, relative)?;
     verify_file(&path)?;
     let before = fs::read(&path)?;
-    let expected = payload["originalSha256"].as_str().context("缺少原文件哈希")?;
-    if digest(&before) != expected { bail!("原文件已变更，请重新读取后再生成补丁：{}", path.display()) }
+    let expected = payload["originalSha256"]
+        .as_str()
+        .context("缺少原文件哈希")?;
+    if digest(&before) != expected {
+        bail!("原文件已变更，请重新读取后再生成补丁：{}", path.display())
+    }
     let new_content = payload["newContent"].as_str().context("缺少新内容")?;
-    if new_content.len() > MAX_BYTES as usize { bail!("新内容超过 {} MB 大小限制", MAX_BYTES / 1024 / 1024) }
+    if new_content.len() > MAX_BYTES as usize {
+        bail!("新内容超过 {} MB 大小限制", MAX_BYTES / 1024 / 1024)
+    }
     let old = String::from_utf8(before).context("仅支持 UTF-8 文本")?;
-    Ok(json!({"status":"awaiting_approval", "relativePath":relative, "originalSha256":expected, "newSha256":digest(new_content.as_bytes()), "preview":{"before":old,"after":new_content}}))
+    Ok(
+        json!({"status":"awaiting_approval", "relativePath":relative, "originalSha256":expected, "newSha256":digest(new_content.as_bytes()), "preview":{"before":old,"after":new_content}}),
+    )
 }
 
 fn apply(root: &Root, payload: &Value) -> Result<Value> {
@@ -152,18 +279,38 @@ fn apply(root: &Root, payload: &Value) -> Result<Value> {
     verify_file(&path)?;
     validate_approval_token(payload).context("审批令牌无效，拒绝写入")?;
     let before = fs::read(&path)?;
-    let expected = payload["originalSha256"].as_str().context("缺少原文件哈希")?;
-    if digest(&before) != expected { bail!("原文件已变更，拒绝覆盖（请重新生成补丁）：{}", path.display()) }
+    let expected = payload["originalSha256"]
+        .as_str()
+        .context("缺少原文件哈希")?;
+    if digest(&before) != expected {
+        bail!(
+            "原文件已变更，拒绝覆盖（请重新生成补丁）：{}",
+            path.display()
+        )
+    }
     let content = payload["newContent"].as_str().context("缺少新内容")?;
-    if content.len() > MAX_BYTES as usize { bail!("新内容超过 {} MB 大小限制", MAX_BYTES / 1024 / 1024) }
+    if content.len() > MAX_BYTES as usize {
+        bail!("新内容超过 {} MB 大小限制", MAX_BYTES / 1024 / 1024)
+    }
     let temp = path.with_extension(format!("agent-tmp-{}", uuid::Uuid::new_v4()));
-    { let mut file = fs::File::create(&temp)?; file.write_all(content.as_bytes())?; file.sync_all()?; }
-    if let Err(error) = fs::rename(&temp, &path) { let _ = fs::remove_file(&temp); return Err(error.into()); }
+    {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(json!({"relativePath":relative,"sha256":digest(content.as_bytes())}))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum CommandClass { Auto, Approval, Denied }
+enum CommandClass {
+    Auto,
+    Approval,
+    Denied,
+}
 
 fn split_command(input: &str) -> Result<Vec<String>> {
     if input.len() > MAX_COMMAND_LEN {
@@ -233,7 +380,10 @@ fn classify_command(args: &[String]) -> (CommandClass, String) {
     if !ALLOWED_PROGRAMS.contains(&program.as_str()) {
         return (
             CommandClass::Denied,
-            format!("程序未在白名单内：{program}（允许：{}）", ALLOWED_PROGRAMS.join("、")),
+            format!(
+                "程序未在白名单内：{program}（允许：{}）",
+                ALLOWED_PROGRAMS.join("、")
+            ),
         );
     }
     if VERSION_PROGRAMS.contains(&program.as_str()) {
@@ -260,48 +410,76 @@ fn classify_command(args: &[String]) -> (CommandClass, String) {
             if args[1..].iter().any(|arg| arg == "--test") {
                 (CommandClass::Auto, String::new())
             } else {
-                (CommandClass::Approval, "node 命令会执行脚本，需要用户批准".into())
+                (
+                    CommandClass::Approval,
+                    "node 命令会执行脚本，需要用户批准".into(),
+                )
             }
         }
         "python" | "py" => classify_python(args),
         "tsc" => {
-            if args.iter().any(|arg| arg == "--noEmit" || arg == "--noEmitOnError") {
+            if args
+                .iter()
+                .any(|arg| arg == "--noEmit" || arg == "--noEmitOnError")
+            {
                 (CommandClass::Auto, String::new())
             } else {
-                (CommandClass::Approval, "tsc 会编译输出文件，需要用户批准".into())
+                (
+                    CommandClass::Approval,
+                    "tsc 会编译输出文件，需要用户批准".into(),
+                )
             }
         }
         "eslint" => {
             if args.iter().any(|arg| arg == "--fix" || arg == "-fix") {
-                (CommandClass::Approval, "eslint --fix 会改写代码，需要用户批准".into())
+                (
+                    CommandClass::Approval,
+                    "eslint --fix 会改写代码，需要用户批准".into(),
+                )
             } else {
                 (CommandClass::Auto, String::new())
             }
         }
         "prettier" => {
             if args.iter().any(|arg| arg == "--write" || arg == "-w") {
-                (CommandClass::Approval, "prettier --write 会改写代码，需要用户批准".into())
+                (
+                    CommandClass::Approval,
+                    "prettier --write 会改写代码，需要用户批准".into(),
+                )
             } else {
                 (CommandClass::Auto, String::new())
             }
         }
-        "rustc" | "javac" | "gcc" | "g++" | "clang" | "clang++" => {
-            (CommandClass::Approval, format!("{program} 会生成编译产物，需要用户批准"))
-        }
-        "java" => (CommandClass::Approval, "java 会运行程序，需要用户批准".into()),
+        "rustc" | "javac" | "gcc" | "g++" | "clang" | "clang++" => (
+            CommandClass::Approval,
+            format!("{program} 会生成编译产物，需要用户批准"),
+        ),
+        "java" => (
+            CommandClass::Approval,
+            "java 会运行程序，需要用户批准".into(),
+        ),
         _ => {
             if AUTO_LIST_PROGRAMS.contains(&program.as_str()) {
                 (CommandClass::Auto, String::new())
             } else {
-                (CommandClass::Approval, format!("{program} 命令需要用户批准后才能执行"))
+                (
+                    CommandClass::Approval,
+                    format!("{program} 命令需要用户批准后才能执行"),
+                )
             }
         }
     }
 }
 
 fn long_running_reason(program: &str, args: &[String]) -> Option<String> {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
-    let script = args.get(2).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let script = args
+        .get(2)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     let long_running = match program {
         "npm" | "pnpm" | "yarn" => {
             (sub == "run" && LONG_RUNNING_SCRIPTS.contains(&script.as_str()))
@@ -310,11 +488,16 @@ fn long_running_reason(program: &str, args: &[String]) -> Option<String> {
         "python" | "py" => sub == "-m" && script == "http.server",
         _ => false,
     };
-    long_running.then(|| "这是长驻/交互命令（开发服务器、监听等），不会自行结束，请改用其他方式验证功能".into())
+    long_running.then(|| {
+        "这是长驻/交互命令（开发服务器、监听等），不会自行结束，请改用其他方式验证功能".into()
+    })
 }
 
 fn classify_git(args: &[String]) -> (CommandClass, String) {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     if DENIED_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
         return (
             CommandClass::Denied,
@@ -325,13 +508,22 @@ fn classify_git(args: &[String]) -> (CommandClass, String) {
         return (CommandClass::Denied, "git 命令缺少子命令".into());
     }
     if sub == "config" {
-        if args.iter().any(|arg| arg == "--global" || arg == "--system") {
+        if args
+            .iter()
+            .any(|arg| arg == "--global" || arg == "--system")
+        {
             return (CommandClass::Denied, "禁止修改全局 git 配置".into());
         }
-        if args.iter().any(|arg| arg == "--list" || arg == "-l" || arg == "--get") {
+        if args
+            .iter()
+            .any(|arg| arg == "--list" || arg == "-l" || arg == "--get")
+        {
             return (CommandClass::Auto, String::new());
         }
-        return (CommandClass::Approval, "git config 可能修改仓库配置，需要用户批准".into());
+        return (
+            CommandClass::Approval,
+            "git config 可能修改仓库配置，需要用户批准".into(),
+        );
     }
     if sub == "checkout" || sub == "switch" {
         if args.iter().any(|arg| arg == "--") || args.get(2).map(String::as_str) == Some(".") {
@@ -340,33 +532,54 @@ fn classify_git(args: &[String]) -> (CommandClass, String) {
                 format!("git {sub} 会丢弃工作区文件改动，禁止执行；如要保留改动请先提交或暂存"),
             );
         }
-        return (CommandClass::Approval, format!("git {sub} 会切换分支/提交，需要用户批准"));
+        return (
+            CommandClass::Approval,
+            format!("git {sub} 会切换分支/提交，需要用户批准"),
+        );
     }
     if sub == "stash" {
         if args.get(2).map(String::as_str) == Some("list") {
             return (CommandClass::Auto, String::new());
         }
-        return (CommandClass::Approval, "git stash 会移动工作区改动，需要用户批准".into());
+        return (
+            CommandClass::Approval,
+            "git stash 会移动工作区改动，需要用户批准".into(),
+        );
     }
     if sub == "tag" {
         if args.len() <= 2 {
             return (CommandClass::Auto, String::new());
         }
-        return (CommandClass::Approval, "git tag 会创建或删除标签，需要用户批准".into());
+        return (
+            CommandClass::Approval,
+            "git tag 会创建或删除标签，需要用户批准".into(),
+        );
     }
     if AUTO_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
         return (CommandClass::Auto, String::new());
     }
     if APPROVAL_GIT_SUBCOMMANDS.contains(&sub.as_str()) {
-        return (CommandClass::Approval, format!("git {sub} 会修改工程状态或联网，需要用户批准"));
+        return (
+            CommandClass::Approval,
+            format!("git {sub} 会修改工程状态或联网，需要用户批准"),
+        );
     }
-    (CommandClass::Approval, format!("git {sub} 命令需要用户批准"))
+    (
+        CommandClass::Approval,
+        format!("git {sub} 命令需要用户批准"),
+    )
 }
 
 fn classify_node_pkg(program: &str, args: &[String]) -> (CommandClass, String) {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     if NPM_PUBLISH_SUBCOMMANDS.contains(&sub.as_str()) {
-        return (CommandClass::Denied, format!("禁止 {program} {sub}（涉及账号或远程发布）"));
+        return (
+            CommandClass::Denied,
+            format!("禁止 {program} {sub}（涉及账号或远程发布）"),
+        );
     }
     if NPM_NETWORK_SUBCOMMANDS.contains(&sub.as_str()) {
         return (
@@ -375,11 +588,17 @@ fn classify_node_pkg(program: &str, args: &[String]) -> (CommandClass, String) {
         );
     }
     if sub == "run" {
-        let script = args.get(2).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+        let script = args
+            .get(2)
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
         if AUTO_BUILD_TEST_SCRIPTS.contains(&script.as_str()) {
             return (CommandClass::Auto, String::new());
         }
-        return (CommandClass::Approval, format!("{program} run {script} 会执行项目脚本，需要用户批准"));
+        return (
+            CommandClass::Approval,
+            format!("{program} run {script} 会执行项目脚本，需要用户批准"),
+        );
     }
     if AUTO_BUILD_TEST_SCRIPTS.contains(&sub.as_str()) {
         return (CommandClass::Auto, String::new());
@@ -387,16 +606,28 @@ fn classify_node_pkg(program: &str, args: &[String]) -> (CommandClass, String) {
     if sub == "ls" {
         return (CommandClass::Auto, String::new());
     }
-    (CommandClass::Approval, format!("{program} {sub} 命令需要用户批准"))
+    (
+        CommandClass::Approval,
+        format!("{program} {sub} 命令需要用户批准"),
+    )
 }
 
 fn classify_cargo(args: &[String]) -> (CommandClass, String) {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     if CARGO_DENIED_SUBCOMMANDS.contains(&sub.as_str()) {
-        return (CommandClass::Denied, format!("禁止 cargo {sub}（涉及全局安装或远程发布）"));
+        return (
+            CommandClass::Denied,
+            format!("禁止 cargo {sub}（涉及全局安装或远程发布）"),
+        );
     }
     if CARGO_NETWORK_SUBCOMMANDS.contains(&sub.as_str()) {
-        return (CommandClass::Approval, format!("cargo {sub} 会联网解析或修改依赖，需要用户批准"));
+        return (
+            CommandClass::Approval,
+            format!("cargo {sub} 会联网解析或修改依赖，需要用户批准"),
+        );
     }
     match sub.as_str() {
         "test" | "build" | "check" | "clippy" | "bench" => (CommandClass::Auto, String::new()),
@@ -404,42 +635,81 @@ fn classify_cargo(args: &[String]) -> (CommandClass, String) {
             if args.iter().any(|arg| arg == "--check") {
                 (CommandClass::Auto, String::new())
             } else {
-                (CommandClass::Approval, "cargo fmt 会改写代码，需要用户批准".into())
+                (
+                    CommandClass::Approval,
+                    "cargo fmt 会改写代码，需要用户批准".into(),
+                )
             }
         }
         "metadata" | "tree" => (CommandClass::Auto, String::new()),
-        "run" => (CommandClass::Approval, "cargo run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into()),
-        _ => (CommandClass::Approval, format!("cargo {sub} 命令需要用户批准")),
+        "run" => (
+            CommandClass::Approval,
+            "cargo run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into(),
+        ),
+        _ => (
+            CommandClass::Approval,
+            format!("cargo {sub} 命令需要用户批准"),
+        ),
     }
 }
 
 fn classify_go(args: &[String]) -> (CommandClass, String) {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     match sub.as_str() {
         "build" | "test" | "vet" => (CommandClass::Auto, String::new()),
-        "fmt" => (CommandClass::Approval, "go fmt 会改写代码，需要用户批准".into()),
-        "run" => (CommandClass::Approval, "go run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into()),
-        _ => (CommandClass::Approval, format!("go {sub} 命令需要用户批准（go.mod 相关操作会联网）")),
+        "fmt" => (
+            CommandClass::Approval,
+            "go fmt 会改写代码，需要用户批准".into(),
+        ),
+        "run" => (
+            CommandClass::Approval,
+            "go run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into(),
+        ),
+        _ => (
+            CommandClass::Approval,
+            format!("go {sub} 命令需要用户批准（go.mod 相关操作会联网）"),
+        ),
     }
 }
 
 fn classify_dotnet(args: &[String]) -> (CommandClass, String) {
-    let sub = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let sub = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     match sub.as_str() {
         "build" | "test" => (CommandClass::Auto, String::new()),
-        "run" => (CommandClass::Approval, "dotnet run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into()),
-        _ => (CommandClass::Approval, format!("dotnet {sub} 命令需要用户批准（add package 会联网）")),
+        "run" => (
+            CommandClass::Approval,
+            "dotnet run 会启动程序，若 60 秒未结束将被终止；确需运行请批准".into(),
+        ),
+        _ => (
+            CommandClass::Approval,
+            format!("dotnet {sub} 命令需要用户批准（add package 会联网）"),
+        ),
     }
 }
 
 fn classify_make(args: &[String]) -> (CommandClass, String) {
-    let target = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let target = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     if target == "install" {
-        return (CommandClass::Denied, "make install 会安装到系统路径，禁止执行".into());
+        return (
+            CommandClass::Denied,
+            "make install 会安装到系统路径，禁止执行".into(),
+        );
     }
     match target.as_str() {
         "test" | "build" | "check" | "all" => (CommandClass::Auto, String::new()),
-        _ => (CommandClass::Approval, format!("make {target} 会执行构建规则，需要用户批准")),
+        _ => (
+            CommandClass::Approval,
+            format!("make {target} 会执行构建规则，需要用户批准"),
+        ),
     }
 }
 
@@ -448,46 +718,85 @@ fn classify_cmake(args: &[String]) -> (CommandClass, String) {
         return (CommandClass::Auto, String::new());
     }
     if args.iter().any(|arg| arg == "--install") {
-        return (CommandClass::Approval, "cmake --install 会安装到指定前缀，需要用户批准".into());
+        return (
+            CommandClass::Approval,
+            "cmake --install 会安装到指定前缀，需要用户批准".into(),
+        );
     }
-    (CommandClass::Approval, "cmake 配置/生成命令需要用户批准（会写入构建目录）".into())
+    (
+        CommandClass::Approval,
+        "cmake 配置/生成命令需要用户批准（会写入构建目录）".into(),
+    )
 }
 
 fn classify_ninja(args: &[String]) -> (CommandClass, String) {
-    let target = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let target = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     match target.as_str() {
         "" | "test" | "check" => (CommandClass::Auto, String::new()),
-        _ => (CommandClass::Approval, format!("ninja {target} 需要用户批准")),
+        _ => (
+            CommandClass::Approval,
+            format!("ninja {target} 需要用户批准"),
+        ),
     }
 }
 
 fn classify_mvn(args: &[String]) -> (CommandClass, String) {
-    let goal = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let goal = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     match goal.as_str() {
         "compile" | "test" | "package" | "verify" | "clean" => (CommandClass::Auto, String::new()),
-        "install" => (CommandClass::Approval, "mvn install 会写入本地仓库，需要用户批准".into()),
-        "deploy" => (CommandClass::Denied, "mvn deploy 会发布到远程仓库，禁止执行".into()),
-        _ => (CommandClass::Approval, format!("mvn {goal} 命令需要用户批准")),
+        "install" => (
+            CommandClass::Approval,
+            "mvn install 会写入本地仓库，需要用户批准".into(),
+        ),
+        "deploy" => (
+            CommandClass::Denied,
+            "mvn deploy 会发布到远程仓库，禁止执行".into(),
+        ),
+        _ => (
+            CommandClass::Approval,
+            format!("mvn {goal} 命令需要用户批准"),
+        ),
     }
 }
 
 fn classify_gradle(args: &[String]) -> (CommandClass, String) {
-    let task = args.get(1).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+    let task = args
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     match task.as_str() {
         "build" | "test" | "check" => (CommandClass::Auto, String::new()),
-        _ => (CommandClass::Approval, format!("gradle {task} 任务需要用户批准")),
+        _ => (
+            CommandClass::Approval,
+            format!("gradle {task} 任务需要用户批准"),
+        ),
     }
 }
 
 fn classify_python(args: &[String]) -> (CommandClass, String) {
     if args.get(1).map(String::as_str) == Some("-m") {
-        let module = args.get(2).map(|value| value.to_ascii_lowercase()).unwrap_or_default();
+        let module = args
+            .get(2)
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
         return match module.as_str() {
             "pytest" | "unittest" => (CommandClass::Auto, String::new()),
-            _ => (CommandClass::Approval, format!("python -m {module} 需要用户批准")),
+            _ => (
+                CommandClass::Approval,
+                format!("python -m {module} 需要用户批准"),
+            ),
         };
     }
-    (CommandClass::Approval, "python 命令会执行脚本，需要用户批准".into())
+    (
+        CommandClass::Approval,
+        "python 命令会执行脚本，需要用户批准".into(),
+    )
 }
 
 async fn read_capped<R>(mut reader: R, cap: usize) -> (Vec<u8>, bool)
@@ -522,7 +831,9 @@ where
 
 #[cfg(windows)]
 fn kill_process_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).spawn();
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .spawn();
 }
 
 #[cfg(not(windows))]
@@ -536,7 +847,10 @@ async fn run_command(root: &Root, payload: &Value) -> Result<Value> {
     if class == CommandClass::Denied {
         bail!("{reason}");
     }
-    let token_ok = match (payload.get("approvalToken"), payload.get("approvalTokenHash")) {
+    let token_ok = match (
+        payload.get("approvalToken"),
+        payload.get("approvalTokenHash"),
+    ) {
         (Some(token), Some(hash)) => {
             let token_value = json!({ "approvalToken": token, "approvalTokenHash": hash });
             validate_approval_token(&token_value).context("审批令牌无效，拒绝执行命令")?;
@@ -546,7 +860,9 @@ async fn run_command(root: &Root, payload: &Value) -> Result<Value> {
     };
     if class == CommandClass::Approval && !token_ok {
         let timeout_seconds = approval_timeout_seconds(payload);
-        return Ok(json!({"status":"awaiting_approval","command":command,"cwd":cwd_relative,"reason":reason,"timeoutSeconds":timeout_seconds}));
+        return Ok(
+            json!({"status":"awaiting_approval","command":command,"cwd":cwd_relative,"reason":reason,"timeoutSeconds":timeout_seconds}),
+        );
     }
     let timeout_seconds = if class == CommandClass::Auto {
         DEFAULT_COMMAND_TIMEOUT.as_secs()
@@ -613,23 +929,103 @@ fn approval_timeout_seconds(payload: &Value) -> u64 {
 mod tests {
     use super::*;
     use std::fs;
-    #[test] fn rejects_escape() { let dir=std::env::temp_dir().join(format!("agent-test-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let root=Root{id:"root".into(),path:dir.clone(),label:"test".into()}; assert!(safe_path(&root,"../secret.c").is_err()); fs::remove_dir_all(dir).unwrap(); }
-    #[test] fn rejects_secret_file() { let dir=std::env::temp_dir().join(format!("agent-secret-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join(".env"); fs::write(&path,"SECRET").unwrap(); assert!(verify_file(&path).is_err()); fs::remove_dir_all(dir).unwrap(); }
-    #[test] fn allows_common_source_files() { let dir=std::env::temp_dir().join(format!("agent-ext-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); for name in ["main.rs","App.tsx","index.js","script.py","style.css","data.json"] { let path=dir.join(name); fs::write(&path,"test").unwrap(); assert!(verify_file(&path).is_ok(), "应允许读取 {name}"); } fs::remove_dir_all(dir).unwrap(); }
-    #[test] fn rejects_oversize_file() { let dir=std::env::temp_dir().join(format!("agent-size-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join("big.bin"); fs::write(&path,vec![0u8;(MAX_BYTES as usize)+1]).unwrap(); assert!(verify_file(&path).is_err()); fs::remove_dir_all(dir).unwrap(); }
-    #[test] fn apply_requires_valid_approval_token() { let dir=std::env::temp_dir().join(format!("agent-apply-{}",uuid::Uuid::new_v4())); fs::create_dir_all(&dir).unwrap(); let path=dir.join("main.c"); fs::write(&path,"int a;").unwrap(); let root=Root{id:"root".into(),path:dir.clone(),label:"test".into()}; let original=digest(&fs::read(&path).unwrap()); let token="approve-token-123456"; let hash=digest(token.as_bytes()); let ok_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":original,"newContent":"int b;","approvalToken":token,"approvalTokenHash":hash}); assert!(apply(&root,&ok_payload).is_ok(), "有效令牌应允许写入"); assert_eq!(fs::read_to_string(&path).unwrap(),"int b;"); let bad_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;","approvalToken":"wrong-token","approvalTokenHash":hash}); assert!(apply(&root,&bad_payload).is_err(), "错误令牌应被拒绝"); let missing_payload=json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;"}); assert!(apply(&root,&missing_payload).is_err(), "缺少令牌应被拒绝"); fs::remove_dir_all(dir).unwrap(); }
-    #[test] fn splits_command_and_rejects_shell_operators() {
-        assert_eq!(split_command("git status --short").unwrap(), vec!["git", "status", "--short"]);
-        assert_eq!(split_command("rg \"TODO|FIXME\" src").unwrap(), vec!["rg", "TODO|FIXME", "src"]);
-        assert_eq!(split_command("git show \"my file.txt\"").unwrap(), vec!["git", "show", "my file.txt"]);
+    #[test]
+    fn rejects_escape() {
+        let dir = std::env::temp_dir().join(format!("agent-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
+        assert!(safe_path(&root, "../secret.c").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn rejects_secret_file() {
+        let dir = std::env::temp_dir().join(format!("agent-secret-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        fs::write(&path, "SECRET").unwrap();
+        assert!(verify_file(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn allows_common_source_files() {
+        let dir = std::env::temp_dir().join(format!("agent-ext-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "main.rs",
+            "App.tsx",
+            "index.js",
+            "script.py",
+            "style.css",
+            "data.json",
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, "test").unwrap();
+            assert!(verify_file(&path).is_ok(), "应允许读取 {name}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn rejects_oversize_file() {
+        let dir = std::env::temp_dir().join(format!("agent-size-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.bin");
+        fs::write(&path, vec![0u8; (MAX_BYTES as usize) + 1]).unwrap();
+        assert!(verify_file(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn apply_requires_valid_approval_token() {
+        let dir = std::env::temp_dir().join(format!("agent-apply-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.c");
+        fs::write(&path, "int a;").unwrap();
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
+        let original = digest(&fs::read(&path).unwrap());
+        let token = "approve-token-123456";
+        let hash = digest(token.as_bytes());
+        let ok_payload = json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":original,"newContent":"int b;","approvalToken":token,"approvalTokenHash":hash});
+        assert!(apply(&root, &ok_payload).is_ok(), "有效令牌应允许写入");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "int b;");
+        let bad_payload = json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;","approvalToken":"wrong-token","approvalTokenHash":hash});
+        assert!(apply(&root, &bad_payload).is_err(), "错误令牌应被拒绝");
+        let missing_payload = json!({"kind":"apply_patch","rootId":"root","relativePath":"main.c","originalSha256":digest(b"int b;"),"newContent":"int c;"});
+        assert!(apply(&root, &missing_payload).is_err(), "缺少令牌应被拒绝");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn splits_command_and_rejects_shell_operators() {
+        assert_eq!(
+            split_command("git status --short").unwrap(),
+            vec!["git", "status", "--short"]
+        );
+        assert_eq!(
+            split_command("rg \"TODO|FIXME\" src").unwrap(),
+            vec!["rg", "TODO|FIXME", "src"]
+        );
+        assert_eq!(
+            split_command("git show \"my file.txt\"").unwrap(),
+            vec!["git", "show", "my file.txt"]
+        );
         assert!(split_command("git status; rm -rf .").is_err());
         assert!(split_command("npm test && npm run build").is_err());
         assert!(split_command("git log --format=\"%h\" | head").is_err());
         assert!(split_command("git log \"未闭合").is_err());
         assert!(split_command("").is_err());
     }
-    #[test] fn classifies_commands() {
-        let class = |command: &str| { let args = split_command(command).unwrap(); classify_command(&args).0 };
+    #[test]
+    fn classifies_commands() {
+        let class = |command: &str| {
+            let args = split_command(command).unwrap();
+            classify_command(&args).0
+        };
         // 只读自动
         assert_eq!(class("git status"), CommandClass::Auto);
         assert_eq!(class("git diff HEAD"), CommandClass::Auto);
@@ -698,12 +1094,18 @@ mod tests {
         // 禁止
         assert_eq!(class("git reset --hard"), CommandClass::Denied);
         assert_eq!(class("git push origin main"), CommandClass::Denied);
-        assert_eq!(class("git clone https://example.com/repo"), CommandClass::Denied);
+        assert_eq!(
+            class("git clone https://example.com/repo"),
+            CommandClass::Denied
+        );
         assert_eq!(class("git checkout -- src/main.c"), CommandClass::Denied);
         assert_eq!(class("git checkout ."), CommandClass::Denied);
         assert_eq!(class("git restore src/main.c"), CommandClass::Denied);
         assert_eq!(class("git clean -fd"), CommandClass::Denied);
-        assert_eq!(class("git config --global user.name x"), CommandClass::Denied);
+        assert_eq!(
+            class("git config --global user.name x"),
+            CommandClass::Denied
+        );
         assert_eq!(class("rm -rf ."), CommandClass::Denied);
         assert_eq!(class("cmd /c dir"), CommandClass::Denied);
         assert_eq!(class("curl https://example.com"), CommandClass::Denied);
@@ -724,8 +1126,13 @@ mod tests {
     async fn run_command_requires_approval_without_token() {
         let dir = std::env::temp_dir().join(format!("agent-cmd-approval-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let root = Root { id: "root".into(), path: dir.clone(), label: "test".into() };
-        let payload = json!({"kind":"run_command","rootId":"root","command":"npm install","cwd":""});
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
+        let payload =
+            json!({"kind":"run_command","rootId":"root","command":"npm install","cwd":""});
         let result = run_command(&root, &payload).await.unwrap();
         assert_eq!(result["status"], "awaiting_approval");
         assert_eq!(result["command"], "npm install");
@@ -737,19 +1144,39 @@ mod tests {
     async fn run_command_rejects_denied_and_bad_token() {
         let dir = std::env::temp_dir().join(format!("agent-cmd-deny-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let root = Root { id: "root".into(), path: dir.clone(), label: "test".into() };
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
         let denied = json!({"kind":"run_command","rootId":"root","command":"rm -rf ."});
-        assert!(run_command(&root, &denied).await.is_err(), "删除命令应被拒绝");
+        assert!(
+            run_command(&root, &denied).await.is_err(),
+            "删除命令应被拒绝"
+        );
         let bad_token = json!({"kind":"run_command","rootId":"root","command":"npm install","approvalToken":"wrong-token-value","approvalTokenHash":"a".repeat(64)});
-        assert!(run_command(&root, &bad_token).await.is_err(), "错误审批令牌应被拒绝");
+        assert!(
+            run_command(&root, &bad_token).await.is_err(),
+            "错误审批令牌应被拒绝"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn run_command_executes_auto_command() {
-        if std::process::Command::new("git").arg("--version").output().is_err() { return; }
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("agent-cmd-auto-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let root = Root { id: "root".into(), path: dir.clone(), label: "test".into() };
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
         let payload = json!({"kind":"run_command","rootId":"root","command":"git --version"});
         let result = run_command(&root, &payload).await.unwrap();
         assert_eq!(result["status"], "completed");
@@ -759,14 +1186,27 @@ mod tests {
     }
     #[tokio::test]
     async fn run_command_executes_with_valid_approval_token() {
-        if std::process::Command::new("npm").arg("--version").output().is_err() { return; }
+        if std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("agent-cmd-token-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        let root = Root { id: "root".into(), path: dir.clone(), label: "test".into() };
+        let root = Root {
+            id: "root".into(),
+            path: dir.clone(),
+            label: "test".into(),
+        };
         let token = "approve-command-token-123456";
         let payload = json!({"kind":"run_command","rootId":"root","command":"npm install","cwd":"","approvalToken":token,"approvalTokenHash":digest(token.as_bytes()),"timeoutSeconds":120});
         let result = run_command(&root, &payload).await.unwrap();
-        assert_eq!(result["status"], "completed", "带有效令牌的命令应执行：{result}");
+        assert_eq!(
+            result["status"], "completed",
+            "带有效令牌的命令应执行：{result}"
+        );
         assert!(result["exitCode"].is_number());
         assert_eq!(result["timeoutSeconds"], 120);
         fs::remove_dir_all(dir).unwrap();
