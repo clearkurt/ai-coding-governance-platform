@@ -14,3 +14,4 @@ apps/web-next/playwright-report/
 __pycache__/
 *.py[cod]
 *.egg-info/
+/docs/handoff.md
